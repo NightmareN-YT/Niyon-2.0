@@ -1,7 +1,8 @@
 import os
 import discord
 from discord.ext import commands
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 # --- Config ---
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
@@ -13,8 +14,7 @@ SYSTEM_PROMPT = (
 )
 MAX_HISTORY = 10  # how many past messages to keep per channel for context
 
-genai.configure(api_key=GEMINI_API_KEY)
-gemini_model = genai.GenerativeModel(MODEL, system_instruction=SYSTEM_PROMPT)
+genai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 intents = discord.Intents.default()
 intents.message_content = True  # must also be enabled in Discord Developer Portal
@@ -54,18 +54,21 @@ async def on_message(message: discord.Message):
 
     channel_id = message.channel.id
     convo = history.setdefault(channel_id, [])
-    convo.append({"role": "user", "parts": [content]})
+    convo.append(types.Content(role="user", parts=[types.Part(text=content)]))
     convo[:] = convo[-MAX_HISTORY:]  # trim history
 
     async with message.channel.typing():
         try:
-            chat = gemini_model.start_chat(history=convo[:-1])
-            response = chat.send_message(content)
+            response = genai_client.models.generate_content(
+                model=MODEL,
+                contents=convo,
+                config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+            )
             reply = response.text.strip()
         except Exception as e:
             reply = f"Sorry, I ran into an error: {e}"
 
-    convo.append({"role": "model", "parts": [reply]})
+    convo.append(types.Content(role="model", parts=[types.Part(text=reply)]))
 
     # Discord has a 2000-character message limit
     for i in range(0, len(reply), 2000):
