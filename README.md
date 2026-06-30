@@ -1,7 +1,8 @@
-# Discord AI Chatbot (Gemini-powered)
+# Discord AI Chatbot (Ollama-powered, local llama3.2:3b)
 
-A Discord bot that replies using the free Google Gemini API. Responds when
-@mentioned or in DMs, and keeps short per-channel conversation context.
+A Discord bot that replies using a locally-hosted Ollama model
+(`llama3.2:3b`). Responds when @mentioned or in DMs, and keeps short
+per-channel conversation context.
 
 ## ⚠️ First: rotate your Discord token
 
@@ -12,14 +13,25 @@ file or host's secret manager, treat it as compromised:
 2. Click **Reset Token** → copy the new one
 3. Use only the new token — never commit it or paste it in chat again
 
-## Get a free Gemini API key
+## Install Ollama and pull the model
 
-1. Go to **aistudio.google.com**
-2. Sign in with a Google account → click **Get API key** → **Create API key**
-3. Copy it — this is your `GEMINI_API_KEY`
+1. Install Ollama: ollama.com/download (macOS, Windows, Linux, or
+   Docker image `ollama/ollama`)
+2. Pull the model:
+   ```
+   ollama pull llama3.2:3b
+   ```
+3. Start the Ollama server (often runs automatically after install, or
+   start manually):
+   ```
+   ollama serve
+   ```
+   By default it listens on `http://localhost:11434`. The bot talks to
+   this server — no API key needed.
 
-The free tier (via Google AI Studio) has no expiration and a generous daily
-quota for `gemini-2.5-flash`, no credit card required.
+**Hardware note:** `llama3.2:3b` needs roughly 3-4GB of free RAM to run
+at usable speed on CPU. A GPU isn't required but will be noticeably
+faster.
 
 ## Setup
 
@@ -32,7 +44,9 @@ quota for `gemini-2.5-flash`, no credit card required.
    fill in real values):
    ```
    DISCORD_TOKEN=your_new_reset_discord_bot_token
-   GEMINI_API_KEY=your_gemini_api_key
+   # Optional overrides (defaults shown):
+   # OLLAMA_HOST=http://localhost:11434
+   # OLLAMA_MODEL=llama3.2:3b
    ```
    `.gitignore` already excludes `.env` — never commit it.
 
@@ -60,24 +74,39 @@ quota for `gemini-2.5-flash`, no credit card required.
 
 ## Deploying so it runs 24/7
 
-Push this folder to a GitHub repo, then connect it to a host that
-auto-deploys from GitHub and supports background workers:
+Because the model runs locally via Ollama (not a hosted API), the bot
+needs to live on a machine that actually has Ollama + the model
+installed and enough RAM to run it — typical free serverless/background
+worker tiers (free Railway/Render plans, etc.) won't have the resources
+for this, so the easiest paths are:
 
-- **Railway** (easiest): New Project → Deploy from GitHub repo → add
-  `DISCORD_TOKEN` and `GEMINI_API_KEY` as environment variables in the
-  Variables tab → it auto-deploys on every push.
-- **Render**: New → Background Worker → connect repo → set the same env
-  vars → start command `python bot.py`.
+- **Your own always-on PC**: run `ollama serve` and `python bot.py` as
+  background processes (e.g. with `tmux`, `screen`, or a systemd
+  service on Linux / a scheduled task on Windows).
+- **A small VPS** (e.g. Hetzner, DigitalOcean, OVH — look for ~4GB RAM
+  / 2 vCPU, roughly $5-12/mo): install Ollama, pull the model, then run
+  the bot the same way as locally. Open no inbound ports — the bot only
+  makes outbound connections to Discord and to its own local Ollama
+  instance.
+- **Docker Compose** on either of the above: run an `ollama/ollama`
+  container alongside a container for `bot.py`, with `OLLAMA_HOST`
+  pointed at the Ollama service name (e.g. `http://ollama:11434`).
 
-Set secrets in the **host's** environment variable panel, not in code or
-a committed `.env`.
+Set `DISCORD_TOKEN` (and any `OLLAMA_HOST`/`OLLAMA_MODEL` overrides) in
+the host's environment variable panel or `.env` file, not in code.
 
 ## Notes
 
 - Conversation history is in-memory and resets when the bot restarts. For
   persistence, swap the `history` dict for SQLite/Redis.
-- Free-tier rate limits on `gemini-2.5-flash` are generous (roughly
-  15 requests/min, 1,500/day as of mid-2026) but can change — check
-  ai.google.dev/pricing if the bot starts erroring on quota.
-- Want Opus/Claude-quality answers occasionally? You can swap `MODEL` to
-  `gemini-2.5-pro` for tougher questions, with lower free-tier limits.
+- `llama3.2:3b` is a small, fast model — good for casual chat, but
+  noticeably weaker at reasoning/coding than larger hosted models. If
+  replies feel too shallow and your hardware can handle it, try pulling
+  a bigger model (`ollama pull llama3.2:8b` or similar) and setting
+  `OLLAMA_MODEL` accordingly — no other code changes needed.
+- Multiple concurrent Discord conversations will queue against the same
+  local Ollama instance, so replies may slow down under heavier traffic
+  since everything runs on one machine instead of a scaled cloud API.
+- Want bigger/smarter-model answers occasionally without changing your
+  whole setup? You can also point `OLLAMA_HOST` at a remote Ollama
+  instance with more RAM/GPU if you have one available.

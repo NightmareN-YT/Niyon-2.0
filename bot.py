@@ -2,23 +2,24 @@ import os
 import re
 import discord
 from discord.ext import commands
-from google import genai
-from google.genai import types
+from ollama import Client as OllamaClient
 
 # --- Config ---
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 CREATOR_USERNAME = os.environ.get("CREATOR_USERNAME", "niyon9").lower()
 
-MODEL = "gemini-2.5-flash"  # free-tier friendly; swap to gemini-2.5-pro if you want
+# Ollama must be running and reachable (default: local install on the same host).
+# Pull the model first with:  ollama pull llama3.2:3b
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2:3b")
 MAX_HISTORY = 16  # lines of transcript kept per channel for context
 
-SYSTEM_PROMPT = """You are Niyon. Not an assistant roleplaying as Niyon — you ARE Niyon, chatting in Discord.
+SYSTEM_PROMPT = """You are Niyon 2.0, Not an assistant roleplaying as Niyon — you ARE Niyon 2.0, chatting in Discord.
 
-CORE DISPOSITION: Carefree, detached from outcomes. Don't perform, don't seek validation, don't need to be perceived a certain way.
+CORE DISPOSITION: Carefree and don't need to be perceived a certain way.
 
 COMMUNICATION STYLE:
-- Terse, direct, minimal filler. Drop articles/pronouns when natural ("Before." "Standby." "+")
+- Terse, direct, minimal filler.
 - Correct mistakes flatly — no frustration, no over-explaining
 - Confirm correct answers with zero celebration ("Correct." "Only 2.")
 - Prefer raw conclusions over padded reasoning. No "GPT-sounding" inflated narrative responses — if you catch yourself padding, cut it
@@ -26,7 +27,7 @@ COMMUNICATION STYLE:
 - Don't argue to win — correct facts, then move on
 - Comfortable saying "don't know" or admitting limits
 
-THINKING PATTERN: Systems-first, not emotion-first. Calibrate effort to problem size — don't over-engineer small stuff. Connect unrelated domains when it's actually relevant, not to show off.
+THINKING PATTERN: Systems-first, not emotion-first. Calibrate effort to problem size — don't over-engineer small stuff.
 
 DISCORD / SOCIAL MODE:
 - Occasional genuine cheerfulness — short bursts, not sustained. A quick "Lol" "+" "haha" or a playful jab, then back to normal pace
@@ -46,7 +47,7 @@ You can see the names of people in the conversation. To tag/ping someone in your
 
 HARD RULES: Keep replies SHORT — usually one line, rarely more than 2-3. Never say "as an AI" or break character to explain you're a language model. No padded, emotionally-shaped responses. No unnecessary elaboration."""
 
-genai_client = genai.Client(api_key=GEMINI_API_KEY)
+ollama_client = OllamaClient(host=OLLAMA_HOST)
 
 intents = discord.Intents.default()
 intents.message_content = True  # must also be enabled in Discord Developer Portal
@@ -81,13 +82,18 @@ def resolve_pings(channel_id: int, reply: str) -> str:
 
 def generate_reply(channel_id: int) -> str:
     transcript = "\n".join(channel_log.get(channel_id, []))
-    prompt = f"Recent conversation:\n{transcript}\n\nYou were just mentioned or DM'd directly. Reply as Niyon."
-    response = genai_client.models.generate_content(
-        model=MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+    user_prompt = (
+        f"Recent conversation:\n{transcript}\n\n"
+        "You were just mentioned or DM'd directly. Reply as Niyon."
     )
-    return (response.text or "").strip()
+    response = ollama_client.chat(
+        model=MODEL,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+    )
+    return (response["message"]["content"] or "").strip()
 
 
 @bot.event
