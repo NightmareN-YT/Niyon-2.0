@@ -47,7 +47,7 @@ You can see the names of people in the conversation. To tag/ping someone in your
 
 HARD RULES: Keep replies SHORT — usually one line, rarely more than 2-3. Never say "as an AI" or break character to explain you're a language model. No padded, emotionally-shaped responses. No unnecessary elaboration."""
 
-ollama_client = OllamaClient(host=OLLAMA_HOST)
+ollama_client = OllamaClient(host=OLLAMA_HOST, timeout=120)
 
 intents = discord.Intents.default()
 intents.message_content = True  # must also be enabled in Discord Developer Portal
