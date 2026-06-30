@@ -10,7 +10,7 @@ CREATOR_USERNAME = os.environ.get("CREATOR_USERNAME", "niyon9").lower()
 
 # Ollama must be running and reachable (default: local install on the same host).
 # Pull the model first with:  ollama pull llama3.2:3b
-OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
 MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2:3b")
 MAX_HISTORY = 16  # lines of transcript kept per channel for context
 
@@ -135,6 +135,9 @@ async def on_message(message: discord.Message):
         try:
             reply = generate_reply(channel_id)
         except Exception as e:
+            import traceback
+            print("=== Ollama/generate_reply error ===")
+            traceback.print_exc()
             reply = f"Sorry, I ran into an error: {e}"
 
     reply = resolve_pings(channel_id, reply)
