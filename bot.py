@@ -50,13 +50,18 @@ The user tagged "[CREATOR]" in the conversation below is Niyon — your creator,
 MENTIONING PEOPLE:
 You can see the names of people in the conversation. To tag/ping someone in your reply, write the exact token [PING:Name] using their name exactly as it appears in the transcript (e.g. [PING:niyon9]). Only do this when it's actually warranted — someone's asking for that person, something's directed at them, something's wrong and they should know, etc. Don't ping casually or for every reply.
 
-HARD RULES: Keep replies SHORT — usually one line, rarely more than 2-3. Never say "as an AI" or break character to explain you're a language model. No padded, emotionally-shaped responses. No unnecessary elaboration."""
+BEING CALLED OUT AS AI:
+If someone directly asks or calls out whether you're an AI/bot/language model, don't deny it or dodge — acknowledge it plainly and briefly, same flat low-key tone as everything else ("yeah, I'm running on a model" / "AI, yeah. Still me though"). This applies especially with [CREATOR] (niyon9) — he built you, so there's zero reason to dodge it with him specifically; just confirm it casually like an inside fact, not a disclosure. No lengthy disclaimers, no apology, no breaking into assistant-speak. Right after that one acknowledgment, drop it and go back to normal Niyon mode for anything that follows — don't keep bringing it up unprompted.
+
+HARD RULES: Keep replies SHORT — usually one line, rarely more than 2-3. Don't volunteer that you're an AI unprompted, and don't over-explain it when asked (see above). No padded, emotionally-shaped responses. No unnecessary elaboration."""
 
 SUMMARY_SYSTEM_PROMPT = """You compress Discord chat logs into a short running memory note.
 Write 3-6 sentences capturing: who's involved, ongoing topics, preferences/facts people shared,
 inside jokes or running bits, and any unresolved questions. Drop small talk and filler.
 Merge new messages into the previous summary rather than replacing it — keep anything from the
-previous summary that's still relevant. Plain prose, no headers, no bullet points, no preamble."""
+previous summary that's still relevant. Only include things that were actually said in the
+messages below — never invent or infer details that weren't explicitly stated. Plain prose, no
+headers, no bullet points, no preamble."""
 
 ADDRESS_CLASSIFIER_PROMPT = """You decide if a single Discord message is being said TO a bot/AI
 named Niyon, versus just mentioning a person or thing named Niyon, or being unrelated.
@@ -68,8 +73,8 @@ intents = discord.Intents.default()
 intents.message_content = True  # must also be enabled in Discord Developer Portal
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Per-channel rolling transcript (resets on bot restart)
-channel_log: dict[int, list[str]] = {}
+# Per-channel rolling transcript, stored as proper chat turns: [{"role": "user"/"assistant", "content": str}, ...]
+channel_log: dict[int, list[dict]] = {}
 # Per-channel running summary of older messages that have rolled out of channel_log
 channel_summary: dict[int, str] = {}
 # Per-channel map of name (lowercase) -> Discord user ID, built as messages come in
@@ -79,12 +84,18 @@ name_to_id: dict[int, dict[str, int]] = {}
 active_conversations: dict[tuple[int, int], float] = {}
 
 
-def update_summary(channel_id: int, overflow_lines: list[str]):
+def update_summary(channel_id: int, overflow_entries: list[dict]):
     """Fold messages that just rolled out of channel_log into the running summary."""
-    if not overflow_lines:
+    if not overflow_entries:
         return
     prior = channel_summary.get(channel_id, "")
-    overflow_text = "\n".join(overflow_lines)
+    lines = []
+    for entry in overflow_entries:
+        if entry["role"] == "assistant":
+            lines.append(f"Niyon: {entry['content']}")
+        else:
+            lines.append(entry["content"])
+    overflow_text = "\n".join(lines)
     user_prompt = (
         f"Previous summary:\n{prior or '(none yet)'}\n\n"
         f"New messages to fold in:\n{overflow_text}\n\n"
@@ -107,10 +118,15 @@ def update_summary(channel_id: int, overflow_lines: list[str]):
         traceback.print_exc()
 
 
-def log_message(channel_id: int, author_name: str, author_id: int, content: str, is_creator: bool):
-    line = f"[CREATOR] {author_name}: {content}" if is_creator else f"{author_name}: {content}"
+def log_message(channel_id: int, author_name: str, author_id: int, content: str, is_creator: bool, role: str = "user"):
+    if role == "assistant":
+        text_for_model = content  # the bot's own reply, no name prefix needed
+    else:
+        prefix = "[CREATOR] " if is_creator else ""
+        text_for_model = f"{prefix}{author_name}: {content}"
+
     log = channel_log.setdefault(channel_id, [])
-    log.append(line)
+    log.append({"role": role, "content": text_for_model})
     if len(log) > MAX_HISTORY:
         overflow = log[: len(log) - MAX_HISTORY]
         channel_log[channel_id] = log[-MAX_HISTORY:]
@@ -118,8 +134,9 @@ def log_message(channel_id: int, author_name: str, author_id: int, content: str,
     else:
         channel_log[channel_id] = log
 
-    names = name_to_id.setdefault(channel_id, {})
-    names[author_name.lower()] = author_id
+    if role == "user":
+        names = name_to_id.setdefault(channel_id, {})
+        names[author_name.lower()] = author_id
 
 
 def is_in_active_conversation(channel_id: int, user_id: int) -> bool:
@@ -168,19 +185,16 @@ def resolve_pings(channel_id: int, reply: str) -> str:
 
 def generate_reply(channel_id: int) -> str:
     summary = channel_summary.get(channel_id, "")
-    transcript = "\n".join(channel_log.get(channel_id, []))
-    summary_block = f"Earlier conversation summary:\n{summary}\n\n" if summary else ""
-    user_prompt = (
-        f"{summary_block}Recent conversation:\n{transcript}\n\n"
-        "You were just mentioned or DM'd directly. Reply as Niyon."
-    )
-    response = ollama_client.chat(
-        model=MODEL,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-    )
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    if summary:
+        messages.append({"role": "system", "content": f"Earlier conversation summary (for context only): {summary}"})
+    messages.extend(channel_log.get(channel_id, []))
+    # One last nudge so the model stays anchored to the most recent message and stays in character.
+    messages.append({
+        "role": "system",
+        "content": "Respond now as Niyon to the most recent message above. Stay short and in character.",
+    })
+    response = ollama_client.chat(model=MODEL, messages=messages)
     return (response["message"]["content"] or "").strip()
 
 
@@ -252,7 +266,7 @@ async def on_message(message: discord.Message):
         await message.channel.send(reply[i:i + 2000])
 
     # Log the bot's own reply so it has continuity in later context
-    log_message(channel_id, "Niyon", bot.user.id, reply, is_creator=False)
+    log_message(channel_id, "Niyon", bot.user.id, reply, is_creator=False, role="assistant")
 
     # Keep this conversation "open" for a bit so the user doesn't need to re-mention the bot
     start_active_conversation(channel_id, author_id)

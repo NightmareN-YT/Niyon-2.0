@@ -100,12 +100,14 @@ the host's environment variable panel or `.env` file, not in code.
 
 ## Notes
 
-- The bot keeps the last 16 lines per channel as raw transcript (`MAX_HISTORY`)
-  for immediate context. Once older messages roll out of that window, they're
-  automatically folded into a short running summary per channel (using the
-  same Ollama model), so the bot retains a sense of who's involved and what's
-  been going on well beyond the last 16 lines — without sending the entire
-  history on every request.
+- The bot keeps the last 16 messages per channel as proper conversation turns
+  (each tagged `user` or `assistant`, not flattened into one text blob), so it
+  reliably tracks its own previous replies and stays anchored to the actual
+  last message instead of drifting into unrelated responses. Once older
+  messages roll out of that window, they're automatically folded into a short
+  running summary per channel (using the same Ollama model), so the bot
+  retains a sense of who's involved and what's been going on well beyond the
+  last 16 messages — without sending the entire history on every request.
 - Both the raw transcript and the summary are in-memory and reset when the
   bot restarts. For persistence across restarts, swap `channel_log` and
   `channel_summary` for SQLite/Redis.
