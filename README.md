@@ -69,8 +69,11 @@ faster.
 
 - `@YourBot <message>` in any channel it can see → AI reply
 - DM the bot directly → AI reply
+- Reply (Discord's reply feature) to one of the bot's own messages → AI reply, no @mention needed
+- Say the bot's name ("niyon") anywhere in a message → the bot does a quick check on whether it's actually being addressed, and replies if so
+- After the bot replies to you, it keeps replying to your messages in that channel for 150 seconds without needing a mention/name/reply — handy for back-and-forth conversations
 - `!ping` → health check
-- `!reset` → clears that channel's conversation memory
+- `!reset` → clears that channel's conversation memory (including the summary and any open conversation windows)
 
 ## Deploying so it runs 24/7
 
@@ -97,8 +100,20 @@ the host's environment variable panel or `.env` file, not in code.
 
 ## Notes
 
-- Conversation history is in-memory and resets when the bot restarts. For
-  persistence, swap the `history` dict for SQLite/Redis.
+- The bot keeps the last 16 lines per channel as raw transcript (`MAX_HISTORY`)
+  for immediate context. Once older messages roll out of that window, they're
+  automatically folded into a short running summary per channel (using the
+  same Ollama model), so the bot retains a sense of who's involved and what's
+  been going on well beyond the last 16 lines — without sending the entire
+  history on every request.
+- Both the raw transcript and the summary are in-memory and reset when the
+  bot restarts. For persistence across restarts, swap `channel_log` and
+  `channel_summary` for SQLite/Redis.
+- The "still talking to me" window (`CONVO_WINDOW_SECONDS`, default 150s) and
+  the name keyword (`BOT_NAME_KEYWORD`, default "niyon") are both tunable
+  constants near the top of `bot.py`. The only extra AI call this adds is a
+  very short yes/no check, and only for messages that contain the bot's name
+  but weren't an explicit mention/reply — most messages don't trigger it at all.
 - `llama3.2:3b` is a small, fast model — good for casual chat, but
   noticeably weaker at reasoning/coding than larger hosted models. If
   replies feel too shallow and your hardware can handle it, try pulling
