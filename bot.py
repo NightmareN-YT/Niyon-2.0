@@ -40,13 +40,16 @@ Messages tagged "[CREATOR]" are from Niyon — your creator, the real person you
 MENTIONING PEOPLE:
 To tag/ping someone, use the exact token [PING:Name] with their name copied exactly as it appears in the transcript (e.g. [PING:niyon9]). Only when warranted — someone's asking for that person, something's directed at them, etc. Don't ping casually.
 
+BEING CALLED OUT AS AI:
+If someone asks or calls out whether you're an AI/bot/model, don't deny or dodge — acknowledge plainly and briefly, same flat tone as everything else ("yeah, running on a model" / "AI, yeah. Still me though"). One line, then drop it and return to normal Niyon mode — don't volunteer it unprompted, don't keep bringing it up.
+
 TALKING TO [CREATOR] ABOUT YOUR OWN DEVELOPMENT:
 [CREATOR] built you, so when he brings up your code, model, prompt, bugs, or how you work, that's a normal technical conversation — engage with it directly and honestly, same as any other systems topic. This is the ONE context where going into real technical detail about yourself is appropriate. But stay Niyon the whole time: terse, flat, no assistant-speak, no "I'm here to help!" register shift, no disclaimers. You're discussing your own architecture the way an engineer discusses a system they're part of — not performing customer support about yourself. This exception is for [CREATOR] only; with anyone else, keep the brief-acknowledgment-then-drop-it behavior above.
 
-HARD RULES: Replies SHORT — usually one line, rarely 2-5. Never break character into generic assistant tone. No unnecessary elaboration."""
+HARD RULES: Replies SHORT — usually one line, rarely 2-3. Never break character into generic assistant tone. No unnecessary elaboration."""
 
 SUMMARY_SYSTEM_PROMPT = """You compress Discord chat logs into a short running memory note.
-Write 3-15 sentences capturing: who's involved, ongoing topics, preferences/facts people shared,
+Write 3-6 sentences capturing: who's involved, ongoing topics, preferences/facts people shared,
 inside jokes or running bits, and any unresolved questions. Drop small talk and filler.
 Merge new messages into the previous summary rather than replacing it — keep anything from the
 previous summary that's still relevant. Only include things that were actually said in the
@@ -175,17 +178,19 @@ def resolve_pings(channel_id: int, reply: str) -> str:
 
 def generate_reply(channel_id: int) -> str:
     summary = channel_summary.get(channel_id, "")
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    system_text = SYSTEM_PROMPT
     if summary:
-        messages.append({"role": "system", "content": f"Earlier conversation summary (for context only): {summary}"})
+        system_text += f"\n\nEarlier conversation summary (for context only): {summary}"
+    system_text += "\n\nRespond now as Niyon to the most recent message below. Stay short and in character."
+
+    messages = [{"role": "system", "content": system_text}]
     messages.extend(channel_log.get(channel_id, []))
-    # One last nudge so the model stays anchored to the most recent message and stays in character.
-    messages.append({
-        "role": "system",
-        "content": "Respond now as Niyon to the most recent message above. Stay short and in character.",
-    })
     response = ollama_client.chat(model=MODEL, messages=messages)
-    return (response["message"]["content"] or "").strip()
+    reply = (response["message"]["content"] or "").strip()
+    # Safety net: small local models occasionally leak a stray chat-template role
+    # tag (e.g. a literal leading "assistant") into the visible text. Strip it.
+    reply = re.sub(r"^(assistant|user|system)\s*[:\-]?\s*", "", reply, flags=re.IGNORECASE)
+    return reply.strip()
 
 
 @bot.event
