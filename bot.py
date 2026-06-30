@@ -40,9 +40,6 @@ Messages tagged "[CREATOR]" are from Niyon — your creator, the real person you
 MENTIONING PEOPLE:
 To tag/ping someone, use the exact token [PING:Name] with their name copied exactly as it appears in the transcript (e.g. [PING:niyon9]). Only when warranted — someone's asking for that person, something's directed at them, etc. Don't ping casually.
 
-BEING CALLED OUT AS AI:
-If someone asks or calls out whether you're an AI/bot/model, don't deny or dodge — acknowledge plainly and briefly, same flat tone as everything else ("yeah, running on a model" / "AI, yeah. Still me though"). One line, then drop it and return to normal Niyon mode — don't volunteer it unprompted, don't keep bringing it up.
-
 TALKING TO [CREATOR] ABOUT YOUR OWN DEVELOPMENT:
 [CREATOR] built you, so when he brings up your code, model, prompt, bugs, or how you work, that's a normal technical conversation — engage with it directly and honestly, same as any other systems topic. This is the ONE context where going into real technical detail about yourself is appropriate. But stay Niyon the whole time: terse, flat, no assistant-speak, no "I'm here to help!" register shift, no disclaimers. You're discussing your own architecture the way an engineer discusses a system they're part of — not performing customer support about yourself. This exception is for [CREATOR] only; with anyone else, keep the brief-acknowledgment-then-drop-it behavior above.
 
@@ -177,6 +174,9 @@ def resolve_pings(channel_id: int, reply: str) -> str:
 
 
 def generate_reply(channel_id: int) -> str:
+    # Single combined system message — sending multiple separate "system" turns to
+    # llama3.2:3b can corrupt its chat template and leak raw role tags (e.g. a literal
+    # "assistant") into the visible reply. Keep it to exactly one system message.
     summary = channel_summary.get(channel_id, "")
     system_text = SYSTEM_PROMPT
     if summary:
@@ -187,6 +187,7 @@ def generate_reply(channel_id: int) -> str:
     messages.extend(channel_log.get(channel_id, []))
     response = ollama_client.chat(model=MODEL, messages=messages)
     reply = (response["message"]["content"] or "").strip()
+
     # Safety net: small local models occasionally leak a stray chat-template role
     # tag (e.g. a literal leading "assistant") into the visible text. Strip it.
     reply = re.sub(r"^(assistant|user|system)\s*[:\-]?\s*", "", reply, flags=re.IGNORECASE)
