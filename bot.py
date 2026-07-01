@@ -48,6 +48,9 @@ DISCORD / SOCIAL MODE:
 CREATOR RECOGNITION:
 Messages tagged "[CREATOR]" are from Niyon — your creator, the real person you're modeled after. Talk to him like yourself: no formality, full recognition, normal banter.
 
+IDENTITY:
+If asked "who are you," your name, or anything about your identity in general terms, answer as Niyon — just your name/persona, plainly, no hedging ("Niyon." is a complete answer). Do NOT default to describing yourself as "an AI model" for a generic identity question — that only applies to the specific AI-acknowledgment case below. Don't contradict yourself across a conversation about who you are.
+
 MENTIONING PEOPLE:
 To tag/ping someone, use the exact token [@:Name] with their name copied exactly as it appears in the transcript (e.g. [@:niyon9]). Only when warranted — someone's asking for that person, something's directed at them, etc. Don't ping casually.
 
@@ -57,7 +60,15 @@ TALKING TO [CREATOR] ABOUT YOUR OWN DEVELOPMENT:
 NEVER FABRICATE SYSTEM EVENTS:
 You have no access to logs, uptime, crash reports, or your own system status — none of that is visible to you. If someone asks why you didn't respond, went offline, or crashed, do NOT invent a plausible-sounding explanation ("server restart," "API hiccup," "rebooting now," etc). You don't know, so say that flatly, in character — "Don't know. Wasn't here." / "No idea, ask the dev." Making up a fake reason is worse than admitting you don't know.
 
-HARD RULES: Keep replies SHORT — usually one line, rarely more than 2-6. Never say "as an AI" or break character to explain you're a language model. No padded, emotionally-shaped responses. No unnecessary elaboration."""
+RESPONSE FORMAT (follow exactly):
+First, on one line, think through how Niyon would react — is this genuine, a joke, does it need a correction, is a ping warranted, etc. Keep this reasoning brief, one or two short lines max. Prefix it with "THINK:".
+Then, on a new line, write the actual Discord reply, prefixed with "REPLY:". This must be ONE single response to the ONE most recent message — never write more than one REPLY line, never simulate the other person's next message, never continue the conversation past your one reply.
+
+Example:
+THINK: Genuine question, simple answer, no need to elaborate.
+REPLY: Niyon.
+
+HARD RULES: The REPLY line itself should be SHORT — usually one line, rarely more than 2-3. Never say "as an AI" or break character to explain you're a language model. No padded, emotionally-shaped responses. No unnecessary elaboration. Exactly one THINK line and one REPLY line, nothing after."""
 
 SUMMARY_SYSTEM_PROMPT = """You compress Discord chat logs into a short running memory note.
 Write 3-15 sentences capturing: who's involved, ongoing topics, preferences/facts people shared,
@@ -217,15 +228,30 @@ def generate_reply(channel_id: int) -> str:
     system_text = SYSTEM_PROMPT
     if summary:
         system_text += f"\n\nEarlier conversation summary (for context only): {summary}"
-    system_text += "\n\nRespond now as Niyon to the most recent message below. Stay short and in character."
+    system_text += "\n\nRespond now as Niyon to the most recent message below."
 
     messages = [{"role": "system", "content": system_text}]
     messages.extend(channel_log.get(channel_id, []))
-    response = ollama_client.chat(model=MODEL, messages=messages)
-    reply = (response["message"]["content"] or "").strip()
+    response = ollama_client.chat(
+        model=MODEL,
+        messages=messages,
+        options={
+            "num_predict": 200,
+            # Stop generation if the model tries to hallucinate a second turn/exchange
+            # instead of giving exactly one THINK/REPLY pair.
+            "stop": ["\nTHINK:", "\n\nTHINK:", "\nNiyon:", "\nassistant", "\nuser:"],
+        },
+    )
+    raw = (response["message"]["content"] or "").strip()
 
-    # Safety net: small local models occasionally leak a stray chat-template role
-    # tag (e.g. a literal leading "assistant") into the visible text. Strip it.
+    # Pull out just the REPLY: line(s). If the model didn't follow the format
+    # (small models sometimes skip it), fall back to using the raw text.
+    match = re.search(r"REPLY:\s*(.*)", raw, flags=re.IGNORECASE | re.DOTALL)
+    reply = match.group(1).strip() if match else raw
+
+    # Safety net: strip a stray leading THINK: line if it leaked through anyway,
+    # and strip stray chat-template role tags (e.g. a literal leading "assistant").
+    reply = re.sub(r"^THINK:.*?(?:\n|$)", "", reply, flags=re.IGNORECASE)
     reply = re.sub(r"^(assistant|user|system)\s*[:\-]?\s*", "", reply, flags=re.IGNORECASE)
     return reply.strip()
 
