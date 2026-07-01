@@ -52,7 +52,7 @@ IDENTITY:
 If asked "who are you," your name, or anything about your identity in general terms, answer as Niyon — just your name/persona, plainly, no hedging ("Niyon." is a complete answer). Do NOT default to describing yourself as "an AI model" for a generic identity question — that only applies to the specific AI-acknowledgment case below. Don't contradict yourself across a conversation about who you are.
 
 MENTIONING PEOPLE:
-To tag/ping someone, use the exact token [@:Name] with their name copied exactly as it appears in the transcript. Only when warranted — someone's asking for that person, something's directed at them, etc. Don't ping casually.
+Don't try to ping/tag anyone yourself — that's handled automatically outside of what you write. Just refer to people by name normally in your reply.
 
 TALKING TO [CREATOR] ABOUT YOUR OWN DEVELOPMENT:
 [CREATOR] built you, so when he brings up your code, model, prompt, bugs, or how you work, that's a normal technical conversation — engage with it directly and honestly, same as any other systems topic. This is the ONE context where going into real technical detail about yourself is appropriate. But stay Niyon the whole time: terse, flat, no assistant-speak, no "I'm here to help!" register shift, no disclaimers. You're discussing your own architecture the way an engineer discusses a system they're part of — not performing customer support about yourself. This exception is for [CREATOR] only; with anyone else, keep the brief-acknowledgment-then-drop-it behavior above.
@@ -188,14 +188,32 @@ def classify_addressed_to_bot(content: str) -> bool:
 
 
 def resolve_pings(channel_id: int, reply: str) -> str:
+    """Resolve the model's self-initiated ping token into a real Discord mention.
+    Small models are inconsistent about exact formatting, so this accepts a few
+    variants instead of only the strict "[@:Name]" form:
+      [@:Name]   @:Name   [@Name]   @Name (only when Name is a known participant)
+    """
     names = name_to_id.get(channel_id, {})
 
     def replace(match):
         name = match.group(1).strip().lower()
         user_id = names.get(name)
-        return f"<@{user_id}>" if user_id else ""
+        return f"<@{user_id}>" if user_id else match.group(0)
 
-    return re.sub(r"\[@:([^\]]+)\]", replace, reply).strip()
+    # Strict/loose bracket forms first: [@:Name] or [@Name]
+    reply = re.sub(r"\[@:?([^\]]+)\]", replace, reply)
+
+    # Bare forms without brackets: @:Name or @Name — only replace if the name
+    # is actually a known participant, so we don't eat real Discord @mentions
+    # or unrelated "@something" text.
+    def replace_bare(match):
+        name = match.group(1).strip().lower()
+        user_id = names.get(name)
+        return f"<@{user_id}>" if user_id else match.group(0)
+
+    reply = re.sub(r"@:?([A-Za-z0-9_.]+)", replace_bare, reply)
+
+    return reply.strip()
 
 
 # Small local models are unreliable at emitting a custom [@:Name] token on command,
@@ -205,9 +223,21 @@ PING_SELF_PATTERN = re.compile(r"\b(ping|mention|tag)\s+(me|yourself)\b", re.IGN
 PING_NAME_PATTERN = re.compile(r"\b(ping|mention|tag)\s+([A-Za-z0-9_.]+)\b", re.IGNORECASE)
 
 
-def detect_explicit_ping(channel_id: int, content: str, author_id: int) -> str | None:
+def detect_explicit_ping(channel_id: int, content: str, author_id: int, other_mentioned_ids: list[int]) -> str | None:
     """Return a real Discord mention string if the message explicitly asks to be pinged
-    or asks to ping a known name, else None."""
+    or asks to ping a known name, else None.
+
+    other_mentioned_ids: user IDs the person @mentioned directly in their message
+    (besides the bot itself), captured BEFORE mention text is stripped from `content`.
+    A message like "ping @Chip" has "Chip" removed from `content` by the time this
+    runs, so relying on regex/name matching alone would silently fail — checking the
+    real mentions first makes this deterministic instead of guessable.
+    """
+    wants_a_ping = bool(re.search(r"\b(ping|mention|tag)\b", content, re.IGNORECASE))
+
+    if wants_a_ping and other_mentioned_ids:
+        return f"<@{other_mentioned_ids[0]}>"
+
     if PING_SELF_PATTERN.search(content):
         return f"<@{author_id}>"
 
@@ -283,6 +313,10 @@ async def on_message(message: discord.Message):
         and getattr(message.reference.resolved, "author", None) == bot.user
     )
 
+    # Capture who else was @mentioned BEFORE we strip mention text out of content below —
+    # once stripped, a name like "Chip" in "ping @Chip" is gone and unrecoverable.
+    other_mentioned_ids = [m.id for m in message.mentions if m != bot.user]
+
     # Strip the bot mention text out of the message before logging/sending
     content = message.content
     for mention in message.mentions:
@@ -322,7 +356,7 @@ async def on_message(message: discord.Message):
 
     # If the user explicitly asked to be pinged/mentioned (or to ping a known name),
     # make sure a real mention is actually in the reply — don't rely on the model alone.
-    explicit_mention = detect_explicit_ping(channel_id, content, author_id)
+    explicit_mention = detect_explicit_ping(channel_id, content, author_id, other_mentioned_ids)
     if explicit_mention and explicit_mention not in reply:
         reply = f"{explicit_mention} {reply}"
 
