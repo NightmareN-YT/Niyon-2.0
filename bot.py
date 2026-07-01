@@ -195,10 +195,10 @@ def resolve_pings(channel_id: int, reply: str) -> str:
         user_id = names.get(name)
         return f"<@{user_id}>" if user_id else ""
 
-    return re.sub(r"\[PING:([^\]]+)\]", replace, reply).strip()
+    return re.sub(r"\[@:([^\]]+)\]", replace, reply).strip()
 
 
-# Small local models are unreliable at emitting a custom [PING:Name] token on command,
+# Small local models are unreliable at emitting a custom [@:Name] token on command,
 # so explicit "ping me" / "ping <name>" requests are handled deterministically here in
 # code instead of trusting the model to use the token correctly.
 PING_SELF_PATTERN = re.compile(r"\b(ping|mention|tag)\s+(me|yourself)\b", re.IGNORECASE)
