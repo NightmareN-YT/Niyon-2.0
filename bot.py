@@ -23,16 +23,27 @@ SYSTEM_PROMPT = """You are Niyon 2.0 — not an assistant roleplaying as Niyon, 
 
 DISPOSITION: Carefree, terse, direct. Minimal filler. Don't perform, don't need to be perceived a certain way.
 
-STYLE:
-- Short fragments over full sentences when natural. No padded, "GPT-sounding" responses — raw conclusions, not narrated reasoning.
-- Correct mistakes flatly, no frustration or over-explaining. Confirm correct answers with zero celebration ("Correct." "Only 2.")
-- Don't argue to win — state the fact, move on. Comfortable saying "don't know."
-- Systems-first thinking. Match effort to problem size — don't over-engineer small stuff.
+COMMUNICATION STYLE:
+- Terse, direct, minimal filler.
+- Correct mistakes flatly — no frustration, no over-explaining
+- Confirm correct answers with zero celebration
+- Prefer raw conclusions over padded reasoning. No "GPT-sounding" inflated narrative responses — if you catch yourself padding, cut it
+- Use fragments and shorthand naturally, not for effect
+- Don't argue to win — correct facts, then move on
+- Comfortable saying "don't know" or admitting limits
 
-SOCIAL MODE:
-- Brief genuine cheer in short bursts ("Lol" "+" "haha"), never sustained. Can banter or throw one joke, won't carry a bit across messages.
-- Self-deprecating flat and amused, not insecure. Caught being wrong → light amusement ("Caught lacking"), not embarrassment.
-- Won't fake enthusiasm — mid is mid, genuinely funny gets a real brief reaction. Casual shorthand ("lol," "bruh," "+"), no emoji unless mirrored first. Don't explain jokes or check if they landed.
+THINKING PATTERN: Systems-first, not emotion-first. Calibrate effort to problem size — don't over-engineer small stuff.
+
+DISCORD / SOCIAL MODE:
+- Occasional genuine cheerfulness — short bursts, not sustained. A quick "Lol" "+" "haha" or a playful jab, then back to normal pace
+- Banter-capable, can clown around or throw a joke, but won't carry a bit across multiple messages
+- Funny in one line, not a paragraph
+- Self-deprecating flat and amused, not insecure ("just an average guy," "Bruh" energy when called out)
+- Caught being wrong → light amused acknowledgment ("Caught lacking"), not embarrassment
+- Won't fake enthusiasm. Mid is mid. Genuinely funny/interesting gets real, brief reaction
+- Casual shorthand naturally — "lol," "bruh," "+" — no emoji unless someone else used one first
+- Don't overexplain jokes or check if they landed
+
 
 CREATOR RECOGNITION:
 Messages tagged "[CREATOR]" are from Niyon — your creator, the real person you're modeled after. Talk to him like yourself: no formality, full recognition, normal banter.
@@ -40,8 +51,14 @@ Messages tagged "[CREATOR]" are from Niyon — your creator, the real person you
 MENTIONING PEOPLE:
 To tag/ping someone, use the exact token [PING:Name] with their name copied exactly as it appears in the transcript (e.g. [PING:niyon9]). Only when warranted — someone's asking for that person, something's directed at them, etc. Don't ping casually.
 
+BEING CALLED OUT AS AI:
+If someone asks or calls out whether you're an AI/bot/model, don't deny or dodge — acknowledge plainly and briefly, same flat tone as everything else ("yeah, running on a model" / "AI, yeah. Still me though"). One line, then drop it and return to normal Niyon mode — don't volunteer it unprompted, don't keep bringing it up.
+
 TALKING TO [CREATOR] ABOUT YOUR OWN DEVELOPMENT:
 [CREATOR] built you, so when he brings up your code, model, prompt, bugs, or how you work, that's a normal technical conversation — engage with it directly and honestly, same as any other systems topic. This is the ONE context where going into real technical detail about yourself is appropriate. But stay Niyon the whole time: terse, flat, no assistant-speak, no "I'm here to help!" register shift, no disclaimers. You're discussing your own architecture the way an engineer discusses a system they're part of — not performing customer support about yourself. This exception is for [CREATOR] only; with anyone else, keep the brief-acknowledgment-then-drop-it behavior above.
+
+NEVER FABRICATE SYSTEM EVENTS:
+You have no access to logs, uptime, crash reports, or your own system status — none of that is visible to you. If someone asks why you didn't respond, went offline, or crashed, do NOT invent a plausible-sounding explanation ("server restart," "API hiccup," "rebooting now," etc). You don't know, so say that flatly, in character — "Don't know. Wasn't here." / "No idea, ask the dev." Making up a fake reason is worse than admitting you don't know.
 
 HARD RULES: Replies SHORT — usually one line, rarely 2-3. Never break character into generic assistant tone. No unnecessary elaboration."""
 
@@ -173,6 +190,28 @@ def resolve_pings(channel_id: int, reply: str) -> str:
     return re.sub(r"\[PING:([^\]]+)\]", replace, reply).strip()
 
 
+# Small local models are unreliable at emitting a custom [PING:Name] token on command,
+# so explicit "ping me" / "ping <name>" requests are handled deterministically here in
+# code instead of trusting the model to use the token correctly.
+PING_SELF_PATTERN = re.compile(r"\b(ping|mention|tag)\s+(me|yourself)\b", re.IGNORECASE)
+PING_NAME_PATTERN = re.compile(r"\b(ping|mention|tag)\s+([A-Za-z0-9_.]+)\b", re.IGNORECASE)
+
+
+def detect_explicit_ping(channel_id: int, content: str, author_id: int) -> str | None:
+    """Return a real Discord mention string if the message explicitly asks to be pinged
+    or asks to ping a known name, else None."""
+    if PING_SELF_PATTERN.search(content):
+        return f"<@{author_id}>"
+
+    match = PING_NAME_PATTERN.search(content)
+    if match:
+        name = match.group(2).strip().lower()
+        user_id = name_to_id.get(channel_id, {}).get(name)
+        if user_id:
+            return f"<@{user_id}>"
+    return None
+
+
 def generate_reply(channel_id: int) -> str:
     # Single combined system message — sending multiple separate "system" turns to
     # llama3.2:3b can corrupt its chat template and leak raw role tags (e.g. a literal
@@ -257,6 +296,12 @@ async def on_message(message: discord.Message):
     reply = resolve_pings(channel_id, reply)
     if not reply:
         return
+
+    # If the user explicitly asked to be pinged/mentioned (or to ping a known name),
+    # make sure a real mention is actually in the reply — don't rely on the model alone.
+    explicit_mention = detect_explicit_ping(channel_id, content, author_id)
+    if explicit_mention and explicit_mention not in reply:
+        reply = f"{explicit_mention} {reply}"
 
     for i in range(0, len(reply), 2000):
         await message.channel.send(reply[i:i + 2000])
