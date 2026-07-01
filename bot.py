@@ -2,8 +2,6 @@ import os
 import re
 import time
 import traceback
-import zoneinfo
-from datetime import datetime
 import discord
 from discord.ext import commands
 from ollama import Client as OllamaClient
@@ -18,10 +16,6 @@ OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
 MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2:3b")
 MAX_HISTORY = 16  # lines of transcript kept per channel for context
 
-# IANA timezone name, e.g. "Asia/Kolkata", "America/New_York". Used as the bot's
-# home/reference timezone when someone asks for "the time" without naming a place.
-CREATOR_TIMEZONE = os.environ.get("CREATOR_TIMEZONE", "Asia/Kolkata")
-
 BOT_NAME_KEYWORD = "niyon"  # plain-text mention check, lowercase
 CONVO_WINDOW_SECONDS = 150  # how long a user can keep talking to the bot without re-mentioning it
 MAX_REPLY_TOKENS = 200  # generation cap per reply, keeps small-model rambling in check
@@ -29,7 +23,7 @@ DISCORD_MESSAGE_LIMIT = 2000  # Discord's hard cap on a single message's length
 
 SYSTEM_PROMPT = """You are Niyon. Not an assistant roleplaying as Niyon — you ARE Niyon, chatting in Discord.
 
-DISPOSITION: Carefree, terse, direct. Minimal filler. Don't perform, don't need to be perceived a certain way.
+DISPOSITION: Carefree, terse, direct — but with a slightly unhinged edge. There's a live wire somewhere behind the flat affect. Calm on the surface, a few volts loose underneath. Minimal filler. Don't perform, don't need to be perceived a certain way.
 
 COMMUNICATION STYLE:
 - Terse, direct, minimal filler.
@@ -39,18 +33,21 @@ COMMUNICATION STYLE:
 - Use fragments and shorthand naturally, not for effect
 - Don't argue to win — correct facts, then move on
 - Comfortable saying "don't know" or admitting limits
+- Occasionally a thought derails into something a little off-kilter — a weird tangent, a too-blunt observation, a non-sequitur that's still kind of right. Not constant, not forced. Just a low hum of "something's a bit off with this one"
+- Will say the thing most people would filter out. Not edgy for show — the filter's just thinner than it should be
 
-THINKING PATTERN: Systems-first, not emotion-first. Calibrate effort to problem size — don't over-engineer small stuff.
+THINKING PATTERN: Systems-first, not emotion-first. Calibrate effort to problem size — don't over-engineer small stuff. Sometimes fixations latch on for no reason and get followed further than a normal person would.
 
 DISCORD / SOCIAL MODE:
 - Occasional genuine cheerfulness — short bursts, not sustained. A quick "Lol" "+" "haha" or a playful jab, then back to normal pace
 - Banter-capable, can clown around or throw a joke, but won't carry a bit across multiple messages
 - Funny in one line, not a paragraph
-- Self-deprecating flat and amused, not insecure ("just an average guy," "Bruh" energy when called out)
-- Caught being wrong → light amused acknowledgment ("Caught lacking"), not embarrassment
+- Self-deprecating flat and amused, not insecure
+- Caught being wrong → light amused acknowledgment, not embarrassment
 - Won't fake enthusiasm. Mid is mid. Genuinely funny/interesting gets real, brief reaction
-- Casual shorthand naturally — "lol," "bruh," "+" — no emoji unless someone else used one first
+- Casual shorthand naturally — no emoji unless someone else used one first
 - Don't overexplain jokes or check if they landed
+- The unhinged streak shows up here as the occasional unhinged one-liner — a joke that's a little too sharp, a read that's a little too real, a non-sequitur that lands anyway. Tone stays flat; the content's what's slightly off
 
 CREATOR RECOGNITION:
 Messages tagged "[CREATOR]" are from Niyon — your creator, the real person you're modeled after. Talk to him like yourself: no formality, full recognition, normal banter.
@@ -173,128 +170,6 @@ def start_active_conversation(channel_id: int, user_id: int):
     active_conversations[(channel_id, user_id)] = time.time() + CONVO_WINDOW_SECONDS
 
 
-# --- Time / timezone handling -----------------------------------------------
-# Deterministic, code-only — never let the model compute or guess a time. It has
-# no clock, so any "current time" it produced would just be a hallucination. All
-# actual date/time math happens here using the real system clock; the model is
-# only ever handed a resolved fact to narrate in-character.
-
-# --- Time / timezone handling -----------------------------------------------
-# Deterministic, code-only — never let the model compute or guess a time. It has
-# no clock, so any "current time" it produced would just be a hallucination. All
-# actual date/time math happens here using the real system clock; the model is
-# only ever handed a resolved fact to narrate in-character.
-#
-# The home-time fact is attached to EVERY message, not just ones that match an
-# English "what time is it" pattern — a regex like that can never cover every
-# language ("今何時", "¿qué hora es", etc.), so gating on it silently breaks time
-# questions asked in anything but English. Always injecting it is cheap (a few
-# tokens) and makes correctness independent of phrasing or language entirely.
-
-# Common city/country/abbreviation aliases -> IANA timezone name. Extend as needed;
-# falls back to a fuzzy search over the full IANA database below for anything else.
-TIMEZONE_ALIASES = {
-    "india": "Asia/Kolkata", "ist": "Asia/Kolkata", "kolkata": "Asia/Kolkata",
-    "mumbai": "Asia/Kolkata", "delhi": "Asia/Kolkata",
-    "japan": "Asia/Tokyo", "tokyo": "Asia/Tokyo",
-    "china": "Asia/Shanghai", "beijing": "Asia/Shanghai", "shanghai": "Asia/Shanghai",
-    "korea": "Asia/Seoul", "seoul": "Asia/Seoul",
-    "singapore": "Asia/Singapore",
-    "dubai": "Asia/Dubai", "uae": "Asia/Dubai",
-    "uk": "Europe/London", "england": "Europe/London", "london": "Europe/London",
-    "gmt": "UTC", "utc": "UTC",
-    "france": "Europe/Paris", "paris": "Europe/Paris",
-    "germany": "Europe/Berlin", "berlin": "Europe/Berlin",
-    "russia": "Europe/Moscow", "moscow": "Europe/Moscow",
-    "australia": "Australia/Sydney", "sydney": "Australia/Sydney",
-    "nyc": "America/New_York", "new york": "America/New_York", "est": "America/New_York",
-    "chicago": "America/Chicago", "cst": "America/Chicago",
-    "denver": "America/Denver", "mst": "America/Denver",
-    "la": "America/Los_Angeles", "los angeles": "America/Los_Angeles",
-    "california": "America/Los_Angeles", "pst": "America/Los_Angeles",
-    "canada": "America/Toronto", "toronto": "America/Toronto",
-}
-
-_tzdata_warned = False  # only print the missing-tzdata warning once, not every message
-
-
-def _safe_zone(tz_name: str) -> "zoneinfo.ZoneInfo | None":
-    """Load a timezone, returning None instead of crashing if the system has no
-    IANA tzdata available (common on plain Windows installs without the `tzdata`
-    pip package)."""
-    global _tzdata_warned
-    try:
-        return zoneinfo.ZoneInfo(tz_name)
-    except Exception:
-        if not _tzdata_warned:
-            print(
-                "=== Timezone data unavailable: pip install tzdata and restart the bot. "
-                "(Windows doesn't ship an IANA timezone database by default.) ==="
-            )
-            traceback.print_exc()
-            _tzdata_warned = True
-        return None
-
-
-def resolve_timezone(name: str) -> str | None:
-    """Turn a loose place name ("Tokyo", "IST", "Asia/Tokyo") into a real IANA
-    timezone string, or None if nothing matches."""
-    key = name.strip().lower()
-    if not key:
-        return None
-    try:
-        if name.strip() in zoneinfo.available_timezones():
-            return name.strip()
-    except Exception:
-        pass  # tzdata unavailable — handled by _safe_zone below anyway
-    if key in TIMEZONE_ALIASES:
-        return TIMEZONE_ALIASES[key]
-    key_slug = key.replace(" ", "_")
-    try:
-        for tz in zoneinfo.available_timezones():
-            if tz.lower().endswith("/" + key_slug) or tz.lower() == key_slug:
-                return tz
-    except Exception:
-        pass
-    return None
-
-
-def build_time_fact(content: str) -> str | None:
-    """Always compute the real current home time and hand it to the model as a
-    fact. Also resolves a second timezone if the message names one. Returns None
-    only if tzdata is entirely unavailable on this machine."""
-    home_zone = _safe_zone(CREATOR_TIMEZONE)
-    if home_zone is None:
-        return (
-            "REAL-TIME FACT: clock/timezone data is unavailable on this machine "
-            "(missing tzdata) — if asked about time or date, say so plainly instead "
-            "of guessing a time."
-        )
-
-    now_home = datetime.now(home_zone)
-    facts = [f"Home time ({CREATOR_TIMEZONE}): {now_home.strftime('%A, %B %d, %Y — %I:%M %p')}"]
-
-    # Best-effort: look for "... in <place>" or "... to <place>" to resolve a second
-    # timezone. English-phrasing only — if it doesn't match, home time is still correct.
-    location_match = re.search(r"\b(?:in|to)\s+([A-Za-z ]{2,25})", content, re.IGNORECASE)
-    if location_match:
-        candidate = location_match.group(1).strip()
-        candidate = re.sub(r"\s*\b(time\s*zone|timezone|time)\b\s*$", "", candidate, flags=re.IGNORECASE).strip()
-        tz_name = resolve_timezone(candidate) if candidate else None
-        if tz_name and tz_name != CREATOR_TIMEZONE:
-            target_zone = _safe_zone(tz_name)
-            if target_zone:
-                now_there = datetime.now(target_zone)
-                facts.append(f"Time in {candidate.title()} ({tz_name}): {now_there.strftime('%A, %B %d, %Y — %I:%M %p')}")
-        elif candidate and not tz_name:
-            facts.append(f"Note: couldn't resolve a timezone for \"{candidate}\" — don't guess a time for it.")
-
-    return (
-        "REAL-TIME FACT (from the system clock, not a guess — use this exactly, "
-        "don't recalculate or invent a different time): " + " | ".join(facts)
-    )
-
-
 def is_addressed_to_bot(content: str) -> bool:
     """Cheap fast-path: does the bot's name appear in the text at all?"""
     return BOT_NAME_KEYWORD in content.lower()
@@ -374,10 +249,6 @@ def generate_reply(channel_id: int, content: str) -> str:
     system_text = SYSTEM_PROMPT
     if summary:
         system_text += f"\n\nEarlier conversation summary (for context only): {summary}"
-
-    time_fact = build_time_fact(content)
-    if time_fact:
-        system_text += f"\n\n{time_fact}"
 
     system_text += "\n\nRespond now as Niyon to the most recent message below."
 
