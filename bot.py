@@ -18,6 +18,8 @@ MAX_HISTORY = 16  # lines of transcript kept per channel for context
 
 BOT_NAME_KEYWORD = "niyon"  # plain-text mention check, lowercase
 CONVO_WINDOW_SECONDS = 150  # how long a user can keep talking to the bot without re-mentioning it
+MAX_REPLY_TOKENS = 200  # generation cap per reply, keeps small-model rambling in check
+DISCORD_MESSAGE_LIMIT = 2000  # Discord's hard cap on a single message's length
 
 SYSTEM_PROMPT = """You are Niyon. Not an assistant roleplaying as Niyon — you ARE Niyon, chatting in Discord.
 
@@ -44,7 +46,6 @@ DISCORD / SOCIAL MODE:
 - Casual shorthand naturally — "lol," "bruh," "+" — no emoji unless someone else used one first
 - Don't overexplain jokes or check if they landed
 
-
 CREATOR RECOGNITION:
 Messages tagged "[CREATOR]" are from Niyon — your creator, the real person you're modeled after. Talk to him like yourself: no formality, full recognition, normal banter.
 
@@ -52,7 +53,7 @@ IDENTITY:
 If asked "who are you," your name, or anything about your identity in general terms, answer as Niyon — just your name/persona, plainly, no hedging ("Niyon." is a complete answer). Do NOT default to describing yourself as "an AI model" for a generic identity question — that only applies to the specific AI-acknowledgment case below. Don't contradict yourself across a conversation about who you are.
 
 MENTIONING PEOPLE:
-Don't try to ping/tag anyone yourself — that's handled automatically outside of what you write. Just refer to people by name normally in your reply.
+Don't try to ping/tag anyone yourself with special syntax — pings are inserted automatically outside of what you write. But when someone asks you to ping, mention, tag, greet, or say hi to a person, write an actual short reaction as if you're talking to them — a greeting, one-line acknowledgment, or quick comment ("Yo." "Sup." "Told em." "Sent."). Never just output the person's bare name alone as your whole reply — that reads as broken, not intentional.
 
 TALKING TO [CREATOR] ABOUT YOUR OWN DEVELOPMENT:
 [CREATOR] built you, so when he brings up your code, model, prompt, bugs, or how you work, that's a normal technical conversation — engage with it directly and honestly, same as any other systems topic. This is the ONE context where going into real technical detail about yourself is appropriate. But stay Niyon the whole time: terse, flat, no assistant-speak, no "I'm here to help!" register shift, no disclaimers. You're discussing your own architecture the way an engineer discusses a system they're part of — not performing customer support about yourself. This exception is for [CREATOR] only; with anyone else, keep the brief-acknowledgment-then-drop-it behavior above.
@@ -188,10 +189,10 @@ def classify_addressed_to_bot(content: str) -> bool:
 
 
 def resolve_pings(channel_id: int, reply: str) -> str:
-    """Resolve the model's self-initiated ping token into a real Discord mention.
+    """Catch any ping-style token the model wrote anyway, despite being told not to.
     Small models are inconsistent about exact formatting, so this accepts a few
-    variants instead of only the strict "[@:Name]" form:
-      [@:Name]   @:Name   [@Name]   @Name (only when Name is a known participant)
+    variants: [@:Name]  [@Name]  @:Name  @Name (only when Name is a known participant,
+    so we don't eat real Discord @mentions or unrelated "@something" text).
     """
     names = name_to_id.get(channel_id, {})
 
@@ -200,32 +201,24 @@ def resolve_pings(channel_id: int, reply: str) -> str:
         user_id = names.get(name)
         return f"<@{user_id}>" if user_id else match.group(0)
 
-    # Strict/loose bracket forms first: [@:Name] or [@Name]
-    reply = re.sub(r"\[@:?([^\]]+)\]", replace, reply)
-
-    # Bare forms without brackets: @:Name or @Name — only replace if the name
-    # is actually a known participant, so we don't eat real Discord @mentions
-    # or unrelated "@something" text.
-    def replace_bare(match):
-        name = match.group(1).strip().lower()
-        user_id = names.get(name)
-        return f"<@{user_id}>" if user_id else match.group(0)
-
-    reply = re.sub(r"@:?([A-Za-z0-9_.]+)", replace_bare, reply)
-
+    reply = re.sub(r"\[@:?([^\]]+)\]", replace, reply)   # bracket forms: [@:Name] / [@Name]
+    reply = re.sub(r"@:?([A-Za-z0-9_.]+)", replace, reply)  # bare forms: @:Name / @Name
     return reply.strip()
 
 
-# Small local models are unreliable at emitting a custom [@:Name] token on command,
-# so explicit "ping me" / "ping <name>" requests are handled deterministically here in
-# code instead of trusting the model to use the token correctly.
+# Small local models are unreliable at emitting a custom ping token on command, so
+# explicit "ping me" / "ping <name>" / "say hi to <name>" requests are handled
+# deterministically here in code instead of trusting the model to use any syntax right.
 PING_SELF_PATTERN = re.compile(r"\b(ping|mention|tag)\s+(me|yourself)\b", re.IGNORECASE)
-PING_NAME_PATTERN = re.compile(r"\b(ping|mention|tag)\s+([A-Za-z0-9_.]+)\b", re.IGNORECASE)
+PING_TRIGGER_PATTERN = re.compile(
+    r"\b(ping|mention|tag|greet|shout ?out(?: to)?|wave at|say (?:hi|hello|what'?s up) to)\b",
+    re.IGNORECASE,
+)
 
 
-def detect_explicit_ping(channel_id: int, content: str, author_id: int, other_mentioned_ids: list[int]) -> str | None:
-    """Return a real Discord mention string if the message explicitly asks to be pinged
-    or asks to ping a known name, else None.
+def detect_explicit_ping(content: str, author_id: int, other_mentioned_ids: list[int]) -> str | None:
+    """Return a real Discord mention string if the message explicitly asks to be pinged,
+    or asks to ping/greet someone who was @mentioned directly in the same message.
 
     other_mentioned_ids: user IDs the person @mentioned directly in their message
     (besides the bot itself), captured BEFORE mention text is stripped from `content`.
@@ -233,20 +226,12 @@ def detect_explicit_ping(channel_id: int, content: str, author_id: int, other_me
     runs, so relying on regex/name matching alone would silently fail — checking the
     real mentions first makes this deterministic instead of guessable.
     """
-    wants_a_ping = bool(re.search(r"\b(ping|mention|tag)\b", content, re.IGNORECASE))
-
-    if wants_a_ping and other_mentioned_ids:
+    if PING_TRIGGER_PATTERN.search(content) and other_mentioned_ids:
         return f"<@{other_mentioned_ids[0]}>"
 
     if PING_SELF_PATTERN.search(content):
         return f"<@{author_id}>"
 
-    match = PING_NAME_PATTERN.search(content)
-    if match:
-        name = match.group(2).strip().lower()
-        user_id = name_to_id.get(channel_id, {}).get(name)
-        if user_id:
-            return f"<@{user_id}>"
     return None
 
 
@@ -266,7 +251,7 @@ def generate_reply(channel_id: int) -> str:
         model=MODEL,
         messages=messages,
         options={
-            "num_predict": 200,
+            "num_predict": MAX_REPLY_TOKENS,
             # Stop generation if the model tries to hallucinate a second turn/exchange
             # instead of giving exactly one THINK/REPLY pair.
             "stop": ["\nTHINK:", "\n\nTHINK:", "\nNiyon:", "\nassistant", "\nuser:"],
@@ -356,12 +341,12 @@ async def on_message(message: discord.Message):
 
     # If the user explicitly asked to be pinged/mentioned (or to ping a known name),
     # make sure a real mention is actually in the reply — don't rely on the model alone.
-    explicit_mention = detect_explicit_ping(channel_id, content, author_id, other_mentioned_ids)
+    explicit_mention = detect_explicit_ping(content, author_id, other_mentioned_ids)
     if explicit_mention and explicit_mention not in reply:
         reply = f"{explicit_mention} {reply}"
 
-    for i in range(0, len(reply), 2000):
-        await message.channel.send(reply[i:i + 2000])
+    for i in range(0, len(reply), DISCORD_MESSAGE_LIMIT):
+        await message.channel.send(reply[i:i + DISCORD_MESSAGE_LIMIT])
 
     # Log the bot's own reply so it has continuity in later context
     log_message(channel_id, "Niyon", bot.user.id, reply, is_creator=False, role="assistant")
