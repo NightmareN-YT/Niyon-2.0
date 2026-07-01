@@ -179,12 +179,17 @@ def start_active_conversation(channel_id: int, user_id: int):
 # actual date/time math happens here using the real system clock; the model is
 # only ever handed a resolved fact to narrate in-character.
 
-TIME_QUERY_PATTERN = re.compile(
-    r"\b(what\s*(?:'?s|is)?\s*(?:the\s*)?time|current\s*time|what\s*time\s*is\s*it|"
-    r"what\s*day\s*is\s*it|what'?s\s*today|today'?s\s*date|what'?s\s*the\s*date|"
-    r"convert.*\bto\b.*time|time\s*in\b)",
-    re.IGNORECASE,
-)
+# --- Time / timezone handling -----------------------------------------------
+# Deterministic, code-only — never let the model compute or guess a time. It has
+# no clock, so any "current time" it produced would just be a hallucination. All
+# actual date/time math happens here using the real system clock; the model is
+# only ever handed a resolved fact to narrate in-character.
+#
+# The home-time fact is attached to EVERY message, not just ones that match an
+# English "what time is it" pattern — a regex like that can never cover every
+# language ("今何時", "¿qué hora es", etc.), so gating on it silently breaks time
+# questions asked in anything but English. Always injecting it is cheap (a few
+# tokens) and makes correctness independent of phrasing or language entirely.
 
 # Common city/country/abbreviation aliases -> IANA timezone name. Extend as needed;
 # falls back to a fuzzy search over the full IANA database below for anything else.
@@ -210,6 +215,26 @@ TIMEZONE_ALIASES = {
     "canada": "America/Toronto", "toronto": "America/Toronto",
 }
 
+_tzdata_warned = False  # only print the missing-tzdata warning once, not every message
+
+
+def _safe_zone(tz_name: str) -> "zoneinfo.ZoneInfo | None":
+    """Load a timezone, returning None instead of crashing if the system has no
+    IANA tzdata available (common on plain Windows installs without the `tzdata`
+    pip package)."""
+    global _tzdata_warned
+    try:
+        return zoneinfo.ZoneInfo(tz_name)
+    except Exception:
+        if not _tzdata_warned:
+            print(
+                "=== Timezone data unavailable: pip install tzdata and restart the bot. "
+                "(Windows doesn't ship an IANA timezone database by default.) ==="
+            )
+            traceback.print_exc()
+            _tzdata_warned = True
+        return None
+
 
 def resolve_timezone(name: str) -> str | None:
     """Turn a loose place name ("Tokyo", "IST", "Asia/Tokyo") into a real IANA
@@ -217,37 +242,51 @@ def resolve_timezone(name: str) -> str | None:
     key = name.strip().lower()
     if not key:
         return None
-    if name.strip() in zoneinfo.available_timezones():
-        return name.strip()
+    try:
+        if name.strip() in zoneinfo.available_timezones():
+            return name.strip()
+    except Exception:
+        pass  # tzdata unavailable — handled by _safe_zone below anyway
     if key in TIMEZONE_ALIASES:
         return TIMEZONE_ALIASES[key]
     key_slug = key.replace(" ", "_")
-    for tz in zoneinfo.available_timezones():
-        if tz.lower().endswith("/" + key_slug) or tz.lower() == key_slug:
-            return tz
+    try:
+        for tz in zoneinfo.available_timezones():
+            if tz.lower().endswith("/" + key_slug) or tz.lower() == key_slug:
+                return tz
+    except Exception:
+        pass
     return None
 
 
 def build_time_fact(content: str) -> str | None:
-    """If the message is asking about time/date/timezone, compute the real answer
-    and return it as a short factual note to hand the model. Returns None if the
-    message isn't a time-related query at all."""
-    if not TIME_QUERY_PATTERN.search(content):
-        return None
+    """Always compute the real current home time and hand it to the model as a
+    fact. Also resolves a second timezone if the message names one. Returns None
+    only if tzdata is entirely unavailable on this machine."""
+    home_zone = _safe_zone(CREATOR_TIMEZONE)
+    if home_zone is None:
+        return (
+            "REAL-TIME FACT: clock/timezone data is unavailable on this machine "
+            "(missing tzdata) — if asked about time or date, say so plainly instead "
+            "of guessing a time."
+        )
 
-    now_home = datetime.now(zoneinfo.ZoneInfo(CREATOR_TIMEZONE))
+    now_home = datetime.now(home_zone)
     facts = [f"Home time ({CREATOR_TIMEZONE}): {now_home.strftime('%A, %B %d, %Y — %I:%M %p')}"]
 
-    # Look for "... in <place>" or "... to <place>" to resolve a second timezone.
+    # Best-effort: look for "... in <place>" or "... to <place>" to resolve a second
+    # timezone. English-phrasing only — if it doesn't match, home time is still correct.
     location_match = re.search(r"\b(?:in|to)\s+([A-Za-z ]{2,25})", content, re.IGNORECASE)
     if location_match:
         candidate = location_match.group(1).strip()
         candidate = re.sub(r"\s*\b(time\s*zone|timezone|time)\b\s*$", "", candidate, flags=re.IGNORECASE).strip()
         tz_name = resolve_timezone(candidate) if candidate else None
         if tz_name and tz_name != CREATOR_TIMEZONE:
-            now_there = datetime.now(zoneinfo.ZoneInfo(tz_name))
-            facts.append(f"Time in {candidate.title()} ({tz_name}): {now_there.strftime('%A, %B %d, %Y — %I:%M %p')}")
-        elif not tz_name:
+            target_zone = _safe_zone(tz_name)
+            if target_zone:
+                now_there = datetime.now(target_zone)
+                facts.append(f"Time in {candidate.title()} ({tz_name}): {now_there.strftime('%A, %B %d, %Y — %I:%M %p')}")
+        elif candidate and not tz_name:
             facts.append(f"Note: couldn't resolve a timezone for \"{candidate}\" — don't guess a time for it.")
 
     return (
@@ -430,7 +469,7 @@ async def on_message(message: discord.Message):
         except Exception as e:
             print("=== Ollama/generate_reply error ===")
             traceback.print_exc()
-            reply = f"Sorry, I ran into an error: {e}"
+            reply = "Something broke on my end. Check the console."
 
     reply = resolve_pings(channel_id, reply)
     if not reply:
