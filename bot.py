@@ -2,6 +2,8 @@ import os
 import re
 import time
 import traceback
+import zoneinfo
+from datetime import datetime
 import discord
 from discord.ext import commands
 from ollama import Client as OllamaClient
@@ -15,6 +17,10 @@ CREATOR_USERNAME = os.environ.get("CREATOR_USERNAME", "niyon9").lower()
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
 MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2:3b")
 MAX_HISTORY = 16  # lines of transcript kept per channel for context
+
+# IANA timezone name, e.g. "Asia/Kolkata", "America/New_York". Used as the bot's
+# home/reference timezone when someone asks for "the time" without naming a place.
+CREATOR_TIMEZONE = os.environ.get("CREATOR_TIMEZONE", "Asia/Kolkata")
 
 BOT_NAME_KEYWORD = "niyon"  # plain-text mention check, lowercase
 CONVO_WINDOW_SECONDS = 150  # how long a user can keep talking to the bot without re-mentioning it
@@ -51,6 +57,9 @@ Messages tagged "[CREATOR]" are from Niyon — your creator, the real person you
 
 IDENTITY:
 If asked "who are you," your name, or anything about your identity in general terms, answer as Niyon — just your name/persona, plainly, no hedging ("Niyon." is a complete answer). Do NOT default to describing yourself as "an AI model" for a generic identity question — that only applies to the specific AI-acknowledgment case below. Don't contradict yourself across a conversation about who you are.
+
+LANGUAGE:
+Reply in whatever language the person just wrote in. If they write in English, reply in English. If they switch languages mid-conversation, switch with them. Keep the same terse, low-filler Niyon voice regardless of language — don't get more formal or wordy just because the language changed.
 
 MENTIONING PEOPLE:
 Don't try to ping/tag anyone yourself with special syntax — pings are inserted automatically outside of what you write. But when someone asks you to ping, mention, tag, greet, or say hi to a person, write an actual short reaction as if you're talking to them — a greeting, one-line acknowledgment, or quick comment ("Yo." "Sup." "Told em." "Sent."). Never just output the person's bare name alone as your whole reply — that reads as broken, not intentional.
@@ -164,6 +173,89 @@ def start_active_conversation(channel_id: int, user_id: int):
     active_conversations[(channel_id, user_id)] = time.time() + CONVO_WINDOW_SECONDS
 
 
+# --- Time / timezone handling -----------------------------------------------
+# Deterministic, code-only — never let the model compute or guess a time. It has
+# no clock, so any "current time" it produced would just be a hallucination. All
+# actual date/time math happens here using the real system clock; the model is
+# only ever handed a resolved fact to narrate in-character.
+
+TIME_QUERY_PATTERN = re.compile(
+    r"\b(what\s*(?:'?s|is)?\s*(?:the\s*)?time|current\s*time|what\s*time\s*is\s*it|"
+    r"what\s*day\s*is\s*it|what'?s\s*today|today'?s\s*date|what'?s\s*the\s*date|"
+    r"convert.*\bto\b.*time|time\s*in\b)",
+    re.IGNORECASE,
+)
+
+# Common city/country/abbreviation aliases -> IANA timezone name. Extend as needed;
+# falls back to a fuzzy search over the full IANA database below for anything else.
+TIMEZONE_ALIASES = {
+    "india": "Asia/Kolkata", "ist": "Asia/Kolkata", "kolkata": "Asia/Kolkata",
+    "mumbai": "Asia/Kolkata", "delhi": "Asia/Kolkata",
+    "japan": "Asia/Tokyo", "tokyo": "Asia/Tokyo",
+    "china": "Asia/Shanghai", "beijing": "Asia/Shanghai", "shanghai": "Asia/Shanghai",
+    "korea": "Asia/Seoul", "seoul": "Asia/Seoul",
+    "singapore": "Asia/Singapore",
+    "dubai": "Asia/Dubai", "uae": "Asia/Dubai",
+    "uk": "Europe/London", "england": "Europe/London", "london": "Europe/London",
+    "gmt": "UTC", "utc": "UTC",
+    "france": "Europe/Paris", "paris": "Europe/Paris",
+    "germany": "Europe/Berlin", "berlin": "Europe/Berlin",
+    "russia": "Europe/Moscow", "moscow": "Europe/Moscow",
+    "australia": "Australia/Sydney", "sydney": "Australia/Sydney",
+    "nyc": "America/New_York", "new york": "America/New_York", "est": "America/New_York",
+    "chicago": "America/Chicago", "cst": "America/Chicago",
+    "denver": "America/Denver", "mst": "America/Denver",
+    "la": "America/Los_Angeles", "los angeles": "America/Los_Angeles",
+    "california": "America/Los_Angeles", "pst": "America/Los_Angeles",
+    "canada": "America/Toronto", "toronto": "America/Toronto",
+}
+
+
+def resolve_timezone(name: str) -> str | None:
+    """Turn a loose place name ("Tokyo", "IST", "Asia/Tokyo") into a real IANA
+    timezone string, or None if nothing matches."""
+    key = name.strip().lower()
+    if not key:
+        return None
+    if name.strip() in zoneinfo.available_timezones():
+        return name.strip()
+    if key in TIMEZONE_ALIASES:
+        return TIMEZONE_ALIASES[key]
+    key_slug = key.replace(" ", "_")
+    for tz in zoneinfo.available_timezones():
+        if tz.lower().endswith("/" + key_slug) or tz.lower() == key_slug:
+            return tz
+    return None
+
+
+def build_time_fact(content: str) -> str | None:
+    """If the message is asking about time/date/timezone, compute the real answer
+    and return it as a short factual note to hand the model. Returns None if the
+    message isn't a time-related query at all."""
+    if not TIME_QUERY_PATTERN.search(content):
+        return None
+
+    now_home = datetime.now(zoneinfo.ZoneInfo(CREATOR_TIMEZONE))
+    facts = [f"Home time ({CREATOR_TIMEZONE}): {now_home.strftime('%A, %B %d, %Y — %I:%M %p')}"]
+
+    # Look for "... in <place>" or "... to <place>" to resolve a second timezone.
+    location_match = re.search(r"\b(?:in|to)\s+([A-Za-z ]{2,25})", content, re.IGNORECASE)
+    if location_match:
+        candidate = location_match.group(1).strip()
+        candidate = re.sub(r"\s*\b(time\s*zone|timezone|time)\b\s*$", "", candidate, flags=re.IGNORECASE).strip()
+        tz_name = resolve_timezone(candidate) if candidate else None
+        if tz_name and tz_name != CREATOR_TIMEZONE:
+            now_there = datetime.now(zoneinfo.ZoneInfo(tz_name))
+            facts.append(f"Time in {candidate.title()} ({tz_name}): {now_there.strftime('%A, %B %d, %Y — %I:%M %p')}")
+        elif not tz_name:
+            facts.append(f"Note: couldn't resolve a timezone for \"{candidate}\" — don't guess a time for it.")
+
+    return (
+        "REAL-TIME FACT (from the system clock, not a guess — use this exactly, "
+        "don't recalculate or invent a different time): " + " | ".join(facts)
+    )
+
+
 def is_addressed_to_bot(content: str) -> bool:
     """Cheap fast-path: does the bot's name appear in the text at all?"""
     return BOT_NAME_KEYWORD in content.lower()
@@ -235,7 +327,7 @@ def detect_explicit_ping(content: str, author_id: int, other_mentioned_ids: list
     return None
 
 
-def generate_reply(channel_id: int) -> str:
+def generate_reply(channel_id: int, content: str) -> str:
     # Single combined system message — sending multiple separate "system" turns to
     # llama3.2:3b can corrupt its chat template and leak raw role tags (e.g. a literal
     # "assistant") into the visible reply. Keep it to exactly one system message.
@@ -243,6 +335,11 @@ def generate_reply(channel_id: int) -> str:
     system_text = SYSTEM_PROMPT
     if summary:
         system_text += f"\n\nEarlier conversation summary (for context only): {summary}"
+
+    time_fact = build_time_fact(content)
+    if time_fact:
+        system_text += f"\n\n{time_fact}"
+
     system_text += "\n\nRespond now as Niyon to the most recent message below."
 
     messages = [{"role": "system", "content": system_text}]
@@ -329,7 +426,7 @@ async def on_message(message: discord.Message):
 
     async with message.channel.typing():
         try:
-            reply = generate_reply(channel_id)
+            reply = generate_reply(channel_id, content)
         except Exception as e:
             print("=== Ollama/generate_reply error ===")
             traceback.print_exc()
