@@ -310,9 +310,23 @@ async def on_message(message: discord.Message):
     if not content:
         return
 
+    # If this message is a reply, pull in what it's replying to and prefix it onto what gets
+    # logged — otherwise the model only sees the reply text itself ("what do you think about
+    # this take?") with zero idea what "this take" actually refers to, unlike a human reading
+    # the channel who can see the quoted snippet right there in the Discord UI.
+    reply_context = ""
+    if message.reference is not None and isinstance(message.reference.resolved, discord.Message):
+        quoted = message.reference.resolved
+        quoted_text = quoted.content.strip()
+        if quoted_text:
+            if len(quoted_text) > 200:
+                quoted_text = quoted_text[:200] + "..."
+            quoted_author = "Niyon" if quoted.author == bot.user else quoted.author.display_name
+            reply_context = f'[replying to {quoted_author}: "{quoted_text}"] '
+
     channel_id = message.channel.id
     author_id = message.author.id
-    log_message(channel_id, message.author.display_name, author_id, content, is_creator)
+    log_message(channel_id, message.author.display_name, author_id, f"{reply_context}{content}", is_creator)
 
     # Tiered "should I respond" check:
     # 1. Explicit mention, DM, or reply to one of the bot's own messages -> always respond.
