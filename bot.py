@@ -247,6 +247,13 @@ def generate_reply(channel_id: int, content: str) -> str:
 
     messages = [{"role": "system", "content": system_text}]
     messages.extend(channel_log.get(channel_id, []))
+
+    print(f"\n--- [generate_reply] channel={channel_id} ---")
+    print(f"Summary in use: {summary if summary else '(none)'}")
+    print("Turns sent to model:")
+    for m in channel_log.get(channel_id, []):
+        print(f"  [{m['role']}] {m['content']}")
+
     response = ollama_client.chat(
         model=MODEL,
         messages=messages,
@@ -258,6 +265,7 @@ def generate_reply(channel_id: int, content: str) -> str:
         },
     )
     raw = (response["message"]["content"] or "").strip()
+    print(f"Raw model output:\n{raw}")
 
     # Pull out just the REPLY: line(s). If the model didn't follow the format
     # (small models sometimes skip it), fall back to using the raw text.
@@ -268,7 +276,10 @@ def generate_reply(channel_id: int, content: str) -> str:
     # and strip stray chat-template role tags (e.g. a literal leading "assistant").
     reply = re.sub(r"^THINK:.*?(?:\n|$)", "", reply, flags=re.IGNORECASE)
     reply = re.sub(r"^(assistant|user|system)\s*[:\-]?\s*", "", reply, flags=re.IGNORECASE)
-    return reply.strip()
+    reply = reply.strip()
+    print(f"Final reply sent to Discord: {reply}")
+    print("--- [end generate_reply] ---\n")
+    return reply
 
 
 @bot.event
@@ -326,17 +337,26 @@ async def on_message(message: discord.Message):
 
     channel_id = message.channel.id
     author_id = message.author.id
-    log_message(channel_id, message.author.display_name, author_id, f"{reply_context}{content}", is_creator)
+    logged_text = f"{reply_context}{content}"
+    log_message(channel_id, message.author.display_name, author_id, logged_text, is_creator)
+    print(f"\n[on_message] #{message.channel} <{message.author.display_name}>: {logged_text}")
 
     # Tiered "should I respond" check:
     # 1. Explicit mention, DM, or reply to one of the bot's own messages -> always respond.
     # 2. Still inside this user's active conversation window -> respond, no re-mention needed.
     # 3. Bot's name appears in the text -> ambiguous, ask the model to confirm before responding.
+    reason = None
     should_respond = is_dm or is_mentioned or is_reply_to_bot
+    if should_respond:
+        reason = "dm" if is_dm else ("mentioned" if is_mentioned else "reply_to_bot")
     if not should_respond and is_in_active_conversation(channel_id, author_id):
         should_respond = True
+        reason = "active_conversation_window"
     if not should_respond and is_addressed_to_bot(content):
         should_respond = classify_addressed_to_bot(content)
+        reason = "name_keyword+classifier=yes" if should_respond else "name_keyword+classifier=no"
+
+    print(f"[on_message] should_respond={should_respond} reason={reason}")
 
     if not should_respond:
         return
