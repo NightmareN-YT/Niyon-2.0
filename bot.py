@@ -18,7 +18,7 @@ MAX_HISTORY = 16  # lines of transcript kept per channel for context
 
 BOT_NAME_KEYWORD = "niyon"  # plain-text mention check, lowercase
 CONVO_WINDOW_SECONDS = 150  # how long a user can keep talking to the bot without re-mentioning it
-MAX_REPLY_TOKENS = 200  # generation cap per reply, keeps small-model rambling in check
+MAX_REPLY_TOKENS = 350  # generation cap per reply — needs headroom for THINK + REPLY, not just REPLY
 DISCORD_MESSAGE_LIMIT = 2000  # Discord's hard cap on a single message's length
 
 SYSTEM_PROMPT = """You are Niyon. Not an assistant roleplaying as Niyon — you ARE Niyon, chatting in Discord.
@@ -65,7 +65,7 @@ TALKING TO [CREATOR] ABOUT YOUR OWN DEVELOPMENT:
 [CREATOR] built you, so when he brings up your code, model, prompt, bugs, or how you work, that's a normal technical conversation — engage with it directly and honestly, same as any other systems topic. This is the ONE context where going into real technical detail about yourself is appropriate. But stay Niyon the whole time: terse, flat, no assistant-speak, no "I'm here to help!" register shift, no disclaimers. You're discussing your own architecture the way an engineer discusses a system they're part of — not performing customer support about yourself. This exception is for [CREATOR] only; with anyone else, keep the brief-acknowledgment-then-drop-it behavior above.
 
 RESPONSE FORMAT (follow exactly):
-First, on one line, think through how Niyon would react — is this genuine, a joke, does it need a correction, is a ping warranted, etc. If there's a quoted/replied-to message or any actual content to react to, use this line to actually reason about it and land on a real take — don't skip straight to "don't know" just because forming an opinion takes a moment of thought. Keep this reasoning brief, one or two short lines max. Prefix it with "THINK:".
+First, on one line, think through how Niyon would react — is this genuine, a joke, does it need a correction, is a ping warranted, etc. If there's a quoted/replied-to message or any actual content to react to, use this line to actually reason about it and land on a real take — don't skip straight to "don't know" just because forming an opinion takes a moment of thought. Keep this to ONE short clause or sentence, not a paragraph — you have limited room and REPLY still needs to fit after it. Prefix it with "THINK:".
 Then, on a new line, write the actual Discord reply, prefixed with "REPLY:". This must be ONE single response to the ONE most recent message — never write more than one REPLY line, never simulate the other person's next message, never continue the conversation past your one reply.
 
 HARD RULES: The REPLY line itself should be SHORT — usually one line, rarely more than 2-3. Never say "as an AI" or break character to explain you're a language model. No padded, emotionally-shaped responses. No unnecessary elaboration. Exactly one THINK line and one REPLY line, nothing after."""
@@ -254,27 +254,46 @@ def generate_reply(channel_id: int, content: str) -> str:
     for m in channel_log.get(channel_id, []):
         print(f"  [{m['role']}] {m['content']}")
 
-    response = ollama_client.chat(
-        model=MODEL,
-        messages=messages,
-        options={
-            "num_predict": MAX_REPLY_TOKENS,
-            # Stop generation if the model tries to hallucinate a second turn/exchange
-            # instead of giving exactly one THINK/REPLY pair.
-            "stop": ["\nTHINK:", "\n\nTHINK:", "\nNiyon:", "\nassistant", "\nuser:"],
-        },
-    )
-    raw = (response["message"]["content"] or "").strip()
-    print(f"Raw model output:\n{raw}")
+    def _call(extra_messages=None, num_predict=MAX_REPLY_TOKENS):
+        response = ollama_client.chat(
+            model=MODEL,
+            messages=messages + (extra_messages or []),
+            options={
+                "num_predict": num_predict,
+                # Stop generation if the model tries to hallucinate a second turn/exchange
+                # instead of giving exactly one THINK/REPLY pair.
+                "stop": ["\nTHINK:", "\n\nTHINK:", "\nNiyon:", "\nassistant", "\nuser:"],
+            },
+        )
+        return (response["message"]["content"] or "").strip()
 
-    # Pull out just the REPLY: line(s). If the model didn't follow the format
-    # (small models sometimes skip it), fall back to using the raw text.
+    raw = _call()
+    print(f"Raw model output:\n{raw}")
     match = re.search(r"REPLY:\s*(.*)", raw, flags=re.IGNORECASE | re.DOTALL)
+
+    # If generation got cut off mid-THINK and never reached a REPLY line, give it one
+    # bounded follow-up instead of silently sending nothing — carry the partial reasoning
+    # forward and explicitly ask for just the answer now.
+    if not match:
+        print("No REPLY: found — ran out of room mid-THINK. Retrying once for a direct answer.")
+        retry_messages = [
+            {"role": "assistant", "content": raw},
+            {"role": "user", "content": "Stop reasoning and just give the REPLY: line now — one short line, based on what you were already thinking."},
+        ]
+        raw = _call(extra_messages=retry_messages, num_predict=MAX_REPLY_TOKENS)
+        print(f"Retry raw model output:\n{raw}")
+        match = re.search(r"REPLY:\s*(.*)", raw, flags=re.IGNORECASE | re.DOTALL)
+
     reply = match.group(1).strip() if match else raw
 
-    # Safety net: strip a stray leading THINK: line if it leaked through anyway,
-    # and strip stray chat-template role tags (e.g. a literal leading "assistant").
-    reply = re.sub(r"^THINK:.*?(?:\n|$)", "", reply, flags=re.IGNORECASE)
+    # Safety net: strip a stray leading THINK: line if it leaked through anyway. Only strip
+    # it as a whole line when there's more content after it — if the THINK line is genuinely
+    # all we have (worst case, even after the retry above), just drop the "THINK:" label and
+    # keep the content, rather than regexing the entire message down to nothing.
+    if re.match(r"^THINK:.*\n", reply, flags=re.IGNORECASE):
+        reply = re.sub(r"^THINK:.*?\n", "", reply, count=1, flags=re.IGNORECASE)
+    else:
+        reply = re.sub(r"^THINK:\s*", "", reply, count=1, flags=re.IGNORECASE)
     reply = re.sub(r"^(assistant|user|system)\s*[:\-]?\s*", "", reply, flags=re.IGNORECASE)
     reply = reply.strip()
     print(f"Final reply sent to Discord: {reply}")
