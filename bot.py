@@ -2,9 +2,15 @@ import os
 import re
 import time
 import traceback
+import asyncio
+import tempfile
+import subprocess
+import wave
 import discord
 from discord.ext import commands
+from discord.ext import voice_recv
 from ollama import Client as OllamaClient
+from faster_whisper import WhisperModel
 
 # --- Config ---
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
@@ -20,6 +26,14 @@ BOT_NAME_KEYWORD = "niyon"  # plain-text mention check, lowercase
 CONVO_WINDOW_SECONDS = 150  # how long a user can keep talking to the bot without re-mentioning it
 MAX_REPLY_TOKENS = 200  # generation cap per reply, keeps small-model rambling in check
 DISCORD_MESSAGE_LIMIT = 2000  # Discord's hard cap on a single message's length
+
+# --- Voice config ---
+# Folder containing piper.exe and the .onnx/.onnx.json voice model files.
+PIPER_DIR = os.environ.get("PIPER_DIR", r"C:\Users\ningt\Desktop\Niyon_2.0 AI Model for discord\piper")
+PIPER_EXE = os.path.join(PIPER_DIR, "piper.exe")
+PIPER_VOICE_MODEL = os.environ.get("PIPER_VOICE_MODEL", os.path.join(PIPER_DIR, "en_US-lessac-low.onnx"))
+WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "base")  # tiny/base/small — bigger = slower but more accurate
+VOICE_SAMPLE_RATE = 48000  # Discord's voice audio sample rate
 
 SYSTEM_PROMPT = """You are Niyon. Not an assistant roleplaying as Niyon — you ARE Niyon, chatting in Discord.
 
@@ -84,9 +98,27 @@ Reply with exactly one word: YES or NO. No punctuation, no explanation."""
 
 ollama_client = OllamaClient(host=OLLAMA_HOST, timeout=120)
 
+# Loaded once at startup — reused for every voice transcription. CPU by default;
+# will use your GPU automatically if a CUDA-enabled onnxruntime/ctranslate2 is set up,
+# otherwise falls back to CPU (fine for "tiny"/"base" sizes on this hardware).
+print(f"Loading Whisper model ({WHISPER_MODEL_SIZE})... this can take a moment on first run.")
+whisper_model = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
+print("Whisper model loaded.")
+
 intents = discord.Intents.default()
 intents.message_content = True  # must also be enabled in Discord Developer Portal
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+# guild_id -> voice_recv.VoiceRecvClient currently connected in that guild
+voice_clients: dict[int, "voice_recv.VoiceRecvClient"] = {}
+# guild_id -> the text channel where voice replies/status should be logged, and where
+# the bot pulls conversation context/persona from (reuses the existing text pipeline)
+voice_text_channel: dict[int, int] = {}
+# (guild_id, user_id) -> bytearray of raw PCM audio currently being accumulated for that speaker
+voice_audio_buffers: dict[tuple[int, int], bytearray] = {}
+# (guild_id, user_id) -> asyncio task that will finalize/transcribe once the user stops talking
+voice_silence_tasks: dict[tuple[int, int], asyncio.Task] = {}
+VOICE_SILENCE_SECONDS = 1.2  # how long someone must stop talking before we transcribe what they said
 
 # Per-channel rolling transcript, stored as proper chat turns: [{"role": "user"/"assistant", "content": str}, ...]
 channel_log: dict[int, list[dict]] = {}
@@ -274,6 +306,189 @@ def generate_reply(channel_id: int, content: str) -> str:
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (id: {bot.user.id})")
+
+
+# --- Voice: speaking (Piper TTS) ---------------------------------------------
+
+def synthesize_speech(text: str) -> str:
+    """Run Piper synchronously to generate a wav file for the given text. Returns the file path.
+    Runs in a worker thread (see speak_in_voice) since subprocess calls block."""
+    fd, out_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    result = subprocess.run(
+        [PIPER_EXE, "--model", PIPER_VOICE_MODEL, "--output_file", out_path],
+        input=text.encode("utf-8"),
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Piper failed: {result.stderr.decode(errors='ignore')}")
+    return out_path
+
+
+async def speak_in_voice(vc: "voice_recv.VoiceRecvClient", text: str):
+    """Synthesize text with Piper and play it into the connected voice channel."""
+    try:
+        wav_path = await asyncio.to_thread(synthesize_speech, text)
+    except Exception:
+        print("=== Piper synthesis error ===")
+        traceback.print_exc()
+        return
+
+    while vc.is_playing():
+        await asyncio.sleep(0.2)
+
+    done = asyncio.Event()
+
+    def after_playback(error):
+        if error:
+            print(f"=== Voice playback error: {error} ===")
+        bot.loop.call_soon_threadsafe(done.set)
+        try:
+            os.remove(wav_path)
+        except OSError:
+            pass
+
+    vc.play(discord.FFmpegPCMAudio(wav_path), after=after_playback)
+    await done.wait()
+
+
+# --- Voice: listening (audio capture -> Whisper -> reply) --------------------
+
+MIN_VOICE_AUDIO_BYTES = 40000  # ignore tiny blips/background noise shorter than this
+
+
+async def transcribe_and_respond(guild_id: int, voice_channel_id: int, user: discord.Member, pcm_bytes: bytes):
+    """Write buffered PCM to a wav file, transcribe with Whisper, and reply (voice + optional text log)."""
+    fd, wav_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    with wave.open(wav_path, "wb") as wf:
+        wf.setnchannels(2)
+        wf.setsampwidth(2)
+        wf.setframerate(VOICE_SAMPLE_RATE)
+        wf.writeframes(pcm_bytes)
+
+    try:
+        segments, _ = await asyncio.to_thread(whisper_model.transcribe, wav_path)
+        text = " ".join(seg.text for seg in segments).strip()
+    except Exception:
+        print("=== Whisper transcription error ===")
+        traceback.print_exc()
+        return
+    finally:
+        try:
+            os.remove(wav_path)
+        except OSError:
+            pass
+
+    if not text:
+        return
+
+    # The voice channel's own ID is used as the "channel" for conversation context/memory,
+    # kept separate from any text-channel conversation.
+    channel_id = voice_channel_id
+    author_id = user.id
+    is_creator = user.name.lower() == CREATOR_USERNAME
+    log_message(channel_id, user.display_name, author_id, text, is_creator)
+
+    should_respond = is_in_active_conversation(channel_id, author_id)
+    if not should_respond and is_addressed_to_bot(text):
+        should_respond = classify_addressed_to_bot(text)
+    if not should_respond:
+        return
+
+    try:
+        reply = await asyncio.to_thread(generate_reply, channel_id, text)
+    except Exception:
+        print("=== Voice generate_reply error ===")
+        traceback.print_exc()
+        return
+
+    reply = resolve_pings(channel_id, reply)
+    if not reply:
+        return
+
+    log_message(channel_id, "Niyon", bot.user.id, reply, is_creator=False, role="assistant")
+    start_active_conversation(channel_id, author_id)
+
+    vc = voice_clients.get(guild_id)
+    if vc and vc.is_connected():
+        await speak_in_voice(vc, reply)
+
+    text_channel_id = voice_text_channel.get(guild_id)
+    if text_channel_id:
+        channel = bot.get_channel(text_channel_id)
+        if channel:
+            await channel.send(f"🎙️ **{user.display_name}:** {text}\n**Niyon:** {reply}")
+
+
+async def _finalize_after_silence(guild_id: int, voice_channel_id: int, user: discord.Member):
+    try:
+        await asyncio.sleep(VOICE_SILENCE_SECONDS)
+    except asyncio.CancelledError:
+        return
+    key = (guild_id, user.id)
+    buf = voice_audio_buffers.pop(key, None)
+    voice_silence_tasks.pop(key, None)
+    if not buf or len(buf) < MIN_VOICE_AUDIO_BYTES:
+        return
+    await transcribe_and_respond(guild_id, voice_channel_id, user, bytes(buf))
+
+
+class VoiceListener(voice_recv.AudioSink):
+    """Buffers each speaker's raw PCM audio and schedules transcription once they go quiet."""
+
+    def __init__(self, guild_id: int, voice_channel_id: int):
+        super().__init__()
+        self.guild_id = guild_id
+        self.voice_channel_id = voice_channel_id
+
+    def wants_opus(self) -> bool:
+        return False  # we want decoded PCM, not raw opus frames
+
+    def write(self, user, data):
+        if user is None or user.bot:
+            return
+        key = (self.guild_id, user.id)
+        buf = voice_audio_buffers.setdefault(key, bytearray())
+        buf.extend(data.pcm)
+
+        # This callback runs on voice_recv's background thread, not the asyncio loop —
+        # must hop over to the bot's event loop to (re)schedule the silence timer.
+        existing = voice_silence_tasks.get(key)
+        if existing and not existing.done():
+            existing.cancel()
+        coro = _finalize_after_silence(self.guild_id, self.voice_channel_id, user)
+        voice_silence_tasks[key] = asyncio.run_coroutine_threadsafe(coro, bot.loop)
+
+    def cleanup(self):
+        pass
+
+
+@bot.command()
+async def join(ctx: commands.Context):
+    """Joins your current voice channel and starts listening."""
+    if ctx.author.voice is None or ctx.author.voice.channel is None:
+        await ctx.send("You need to be in a voice channel first.")
+        return
+    channel = ctx.author.voice.channel
+    vc = await channel.connect(cls=voice_recv.VoiceRecvClient)
+    voice_clients[ctx.guild.id] = vc
+    voice_text_channel[ctx.guild.id] = ctx.channel.id
+    vc.listen(VoiceListener(ctx.guild.id, channel.id))
+    await ctx.send(f"Joined **{channel.name}**. Say my name to talk to me.")
+
+
+@bot.command()
+async def leave(ctx: commands.Context):
+    """Leaves the voice channel."""
+    vc = voice_clients.pop(ctx.guild.id, None)
+    voice_text_channel.pop(ctx.guild.id, None)
+    if vc:
+        vc.stop_listening()
+        await vc.disconnect()
+        await ctx.send("Left the voice channel.")
+    else:
+        await ctx.send("Not currently in a voice channel.")
 
 
 @bot.event

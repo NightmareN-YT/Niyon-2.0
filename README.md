@@ -75,7 +75,45 @@ faster.
 - `!ping` → health check
 - `!reset` → clears that channel's conversation memory (including the summary and any open conversation windows)
 
-## Deploying so it runs 24/7
+## Voice chat (join, listen, speak)
+
+The bot can join a voice channel, listen to what people say, and reply out loud —
+fully local, no cloud STT/TTS required.
+
+**Requirements beyond the base setup:**
+1. **FFmpeg** installed and on PATH (`ffmpeg -version` should work in PowerShell).
+   Easiest install: `winget install ffmpeg`, then **restart your terminal**.
+2. **Piper** downloaded, with a voice model (`.onnx` + matching `.onnx.json`) —
+   see ollama/setup steps above for where to get voices. Both files must be present
+   or Piper will hang/fail silently.
+3. Set `PIPER_DIR` (folder containing `piper.exe`) and optionally `PIPER_VOICE_MODEL`
+   (full path to the `.onnx` file) as environment variables, or edit the defaults
+   near the top of `bot.py`.
+4. `pip install -r requirements.txt` now also installs `discord-ext-voice-recv` and
+   `faster-whisper` (used for speech-to-text).
+
+**Commands:**
+- `!join` — bot joins your current voice channel and starts listening
+- `!leave` — bot leaves the voice channel
+
+**How it decides to respond in voice:** same idea as text — say "niyon" in what you're
+saying (wake-word style) or keep talking within the active-conversation window after
+it's replied to you. There's no @mention equivalent in voice, so the name-check is the
+main way to get its attention the first time.
+
+**How it works under the hood:** each speaker's audio is buffered while they talk; once
+they go quiet for about a second, that clip is transcribed locally with Whisper
+(`WHISPER_MODEL_SIZE`, default `base` — smaller/faster: `tiny`; larger/more accurate:
+`small`), and if it's addressed to the bot, the transcribed text is sent through the same
+conversation pipeline used for text chat. The reply is synthesized with Piper and played
+into the voice channel. Voice conversation memory/context is tracked separately per voice
+channel (not merged with any text channel's history).
+
+**Performance note:** running Ollama + Whisper + Piper together is meaningfully heavier
+than text-only — expect a noticeable delay (a few seconds) between someone finishing a
+sentence and the bot replying, especially on CPU-only hardware. This is expected, not a bug.
+
+
 
 Because the model runs locally via Ollama (not a hosted API), the bot
 needs to live on a machine that actually has Ollama + the model
