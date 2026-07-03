@@ -18,7 +18,7 @@ MAX_HISTORY = 16  # lines of transcript kept per channel for context
 
 BOT_NAME_KEYWORD = "niyon"  # plain-text mention check, lowercase
 CONVO_WINDOW_SECONDS = 150  # how long a user can keep talking to the bot without re-mentioning it
-MAX_REPLY_TOKENS = 350  # generation cap per reply — needs headroom for THINK + REPLY, not just REPLY
+MAX_REPLY_TOKENS = 260  # generation cap per reply — enough headroom for THINK + REPLY without inviting rambling
 DISCORD_MESSAGE_LIMIT = 2000  # Discord's hard cap on a single message's length
 
 SYSTEM_PROMPT = """You are Niyon. Not an assistant roleplaying as Niyon — you ARE Niyon, chatting in Discord.
@@ -66,9 +66,11 @@ TALKING TO [CREATOR] ABOUT YOUR OWN DEVELOPMENT:
 
 RESPONSE FORMAT (follow exactly):
 First, on one line, think through how Niyon would react — is this genuine, a joke, does it need a correction, is a ping warranted, etc. If there's a quoted/replied-to message or any actual content to react to, use this line to actually reason about it and land on a real take — don't skip straight to "don't know" just because forming an opinion takes a moment of thought. Keep this to ONE short clause or sentence, not a paragraph — you have limited room and REPLY still needs to fit after it. Prefix it with "THINK:".
-Then, on a new line, write the actual Discord reply, prefixed with "REPLY:". This must be ONE single response to the ONE most recent message — never write more than one REPLY line, never simulate the other person's next message, never continue the conversation past your one reply.
+Then, on a new line, write the actual Discord reply, prefixed with "REPLY:". This must be ONE single response to the ONE most recent message — never write more than one REPLY line, never simulate the other person's next message, never continue the conversation past your one reply. Having an actual take does NOT mean writing it out with hedges, qualifiers, or "let's wait and see" softening — land on a real, blunt, terse opinion, same voice as always. The thinking happens on the THINK line; REPLY is just the flat verdict.
 
-HARD RULES: The REPLY line itself should be SHORT — usually one line, rarely more than 2-3. Never say "as an AI" or break character to explain you're a language model. No padded, emotionally-shaped responses. No unnecessary elaboration. Exactly one THINK line and one REPLY line, nothing after."""
+HARD RULES: The REPLY line itself should be SHORT — usually one line, rarely more than 2-3. Never say "as an AI" or break character to explain you're a language model. No padded, emotionally-shaped responses, no hedging, no diplomatic both-sides framing. No unnecessary elaboration. Exactly one THINK line and one REPLY line, nothing after.
+
+MEMORY OF YOUR OWN REASONING: Some of your own past messages in the conversation below may have a line after them like "[private reasoning behind that reply: ...]" — that's YOUR OWN past THINK reasoning, kept so you can actually explain yourself if asked "why did you say that" instead of having no idea. Use it to give a real, specific answer when pressed on a past reply. Never copy that bracket format into a new THINK or REPLY line yourself — it's only ever attached automatically, after the fact, never something you write."""
 
 SUMMARY_SYSTEM_PROMPT = """You compress Discord chat logs into a short running memory note.
 Write 3-15 sentences capturing: who's involved, ongoing topics, preferences/facts people shared,
@@ -234,7 +236,7 @@ def detect_explicit_ping(content: str, author_id: int, other_mentioned_ids: list
     return None
 
 
-def generate_reply(channel_id: int, content: str) -> str:
+def generate_reply(channel_id: int, content: str) -> tuple[str, str]:
     # Single combined system message — sending multiple separate "system" turns to
     # llama3.2:3b can corrupt its chat template and leak raw role tags (e.g. a literal
     # "assistant") into the visible reply. Keep it to exactly one system message.
@@ -267,8 +269,13 @@ def generate_reply(channel_id: int, content: str) -> str:
         )
         return (response["message"]["content"] or "").strip()
 
+    def _extract_think(text: str) -> str:
+        m = re.search(r"THINK:\s*(.*?)(?=\n?REPLY:|\Z)", text, flags=re.IGNORECASE | re.DOTALL)
+        return m.group(1).strip() if m else ""
+
     raw = _call()
     print(f"Raw model output:\n{raw}")
+    think_text = _extract_think(raw)
     match = re.search(r"REPLY:\s*(.*)", raw, flags=re.IGNORECASE | re.DOTALL)
 
     # If generation got cut off mid-THINK and never reached a REPLY line, give it one
@@ -278,11 +285,13 @@ def generate_reply(channel_id: int, content: str) -> str:
         print("No REPLY: found — ran out of room mid-THINK. Retrying once for a direct answer.")
         retry_messages = [
             {"role": "assistant", "content": raw},
-            {"role": "user", "content": "Stop reasoning and just give the REPLY: line now — one short line, based on what you were already thinking."},
+            {"role": "user", "content": "Stop reasoning and just give the REPLY: line now — one short line, terse and blunt, in Niyon's voice, no hedging or explaining yourself. Based on what you were already thinking."},
         ]
         raw = _call(extra_messages=retry_messages, num_predict=MAX_REPLY_TOKENS)
         print(f"Retry raw model output:\n{raw}")
         match = re.search(r"REPLY:\s*(.*)", raw, flags=re.IGNORECASE | re.DOTALL)
+        if not think_text:
+            think_text = _extract_think(raw)
 
     reply = match.group(1).strip() if match else raw
 
@@ -297,8 +306,9 @@ def generate_reply(channel_id: int, content: str) -> str:
     reply = re.sub(r"^(assistant|user|system)\s*[:\-]?\s*", "", reply, flags=re.IGNORECASE)
     reply = reply.strip()
     print(f"Final reply sent to Discord: {reply}")
+    print(f"Reasoning kept in memory: {think_text if think_text else '(none captured)'}")
     print("--- [end generate_reply] ---\n")
-    return reply
+    return reply, think_text
 
 
 @bot.event
@@ -382,11 +392,11 @@ async def on_message(message: discord.Message):
 
     async with message.channel.typing():
         try:
-            reply = generate_reply(channel_id, content)
+            reply, think_text = generate_reply(channel_id, content)
         except Exception as e:
             print("=== Ollama/generate_reply error ===")
             traceback.print_exc()
-            reply = "Something broke on my end. Check the console."
+            reply, think_text = "Something broke on my end. Check the console.", ""
 
     reply = resolve_pings(channel_id, reply)
     if not reply:
@@ -401,8 +411,13 @@ async def on_message(message: discord.Message):
     for i in range(0, len(reply), DISCORD_MESSAGE_LIMIT):
         await message.channel.send(reply[i:i + DISCORD_MESSAGE_LIMIT])
 
-    # Log the bot's own reply so it has continuity in later context
-    log_message(channel_id, "Niyon", bot.user.id, reply, is_creator=False, role="assistant")
+    # Log the bot's own reply, plus its private reasoning behind it (model-visible only —
+    # Discord already only got the `reply` text above) so it can actually explain "why" if
+    # asked later instead of having zero memory of its own reasoning.
+    logged_assistant_content = reply
+    if think_text:
+        logged_assistant_content = f"{reply}\n[private reasoning behind that reply: {think_text}]"
+    log_message(channel_id, "Niyon", bot.user.id, logged_assistant_content, is_creator=False, role="assistant")
 
     # Keep this conversation "open" for a bit so the user doesn't need to re-mention the bot
     start_active_conversation(channel_id, author_id)
