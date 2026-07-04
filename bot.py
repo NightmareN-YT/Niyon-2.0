@@ -181,6 +181,21 @@ name_to_id: dict[int, dict[str, int]] = {}
 # channel keep getting replies without needing to re-mention/name the bot
 active_conversations: dict[tuple[int, int], float] = {}
 
+# Per-channel asyncio.Lock, so two messages arriving close together in the same channel
+# can't trigger overlapping generate_reply calls that race on channel_log/channel_summary —
+# e.g. user sends message A, then message B 0.2s later before A's reply has finished
+# generating and been logged; without this, B's generate_reply call could read stale
+# history, or both replies could be logged out of order relative to what actually happened.
+channel_locks: dict[int, asyncio.Lock] = {}
+
+
+def get_channel_lock(channel_id: int) -> asyncio.Lock:
+    lock = channel_locks.get(channel_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        channel_locks[channel_id] = lock
+    return lock
+
 
 def update_summary(channel_id: int, overflow_entries: list[dict]):
     """Fold messages that just rolled out of channel_log into the running summary."""
@@ -405,8 +420,10 @@ def generate_reply(channel_id: int, content: str) -> tuple[str, str]:
                 "Answer the user's original message using ONLY this tool result — don't invent "
                 "anything beyond it, and if it doesn't actually answer the question, say you "
                 "couldn't find it. Don't mention that a tool was used. Stay fully in your normal "
-                "Niyon voice and follow the usual THINK:/REPLY: format. Do not request another tool "
-                "unless you genuinely need a different query — you have limited attempts left."
+                "Niyon voice and follow the usual THINK:/REPLY: format exactly — output ONLY the "
+                "THINK: line then the REPLY: line, nothing before, between, or after them. Do not "
+                "request another tool unless you genuinely need a different query — you have "
+                "limited attempts left."
             ),
         })
         raw = _call(extra_messages=tool_context)
@@ -430,19 +447,27 @@ def generate_reply(channel_id: int, content: str) -> tuple[str, str]:
 
     reply = raw.strip()
 
-    #Standard THINK:/REPLY: format
-    match = re.search(
-        r"^THINK:\s*(.*?)\s*REPLY:\s*(.*)$",
+    # THINK and REPLY are extracted independently rather than as one combined pattern —
+    # this way a malformed or missing THINK line doesn't prevent REPLY from being found,
+    # and a stray preamble sentence before either label gets naturally ignored since we're
+    # not anchored to the start of the string.
+    think_match = re.search(
+        r"THINK:\s*(.*?)(?=\nREPLY:|\Z)",
         raw,
         flags=re.IGNORECASE | re.DOTALL,
     )
-    if match:
+    reply_match = re.search(
+        r"REPLY:\s*(.*)",
+        raw,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if think_match or reply_match:
         parser_mode = f"{parser_mode}+THINK_REPLY" if parser_mode == "TOOL" else "THINK_REPLY"
 
-        think_text = (match.group(1) or "").strip()
+        think_text = (think_match.group(1).strip() if think_match else "")
 
-        if match.group(2):
-            reply = match.group(2).strip()
+        if reply_match:
+            reply = reply_match.group(1).strip()
 
     #Raw output containing a private reasoning block
     reasoning = re.search(
@@ -580,44 +605,45 @@ async def on_message(message: discord.Message):
     if not should_respond:
         return
 
-    async with message.channel.typing():
-        try:
-            reply, think_text = await asyncio.to_thread(
-                generate_reply,
-                channel_id,
-                logged_text,
-                )
-            
-        except Exception as e:
-            print("=== Ollama/generate_reply error ===")
-            traceback.print_exc()
-            reply, think_text = "Something broke on my end. Check the console.", ""
+    async with get_channel_lock(channel_id):
+        async with message.channel.typing():
+            try:
+                reply, think_text = await asyncio.to_thread(
+                    generate_reply,
+                    channel_id,
+                    logged_text,
+                    )
 
-    reply = resolve_pings(channel_id, reply)
-    if not reply:
-        return
+            except Exception as e:
+                print("=== Ollama/generate_reply error ===")
+                traceback.print_exc()
+                reply, think_text = "Something broke on my end. Check the console.", ""
 
-    # If the user explicitly asked to be pinged/mentioned (or to ping a known name),
-    # make sure a real mention is actually in the reply — don't rely on the model alone.
-    explicit_mention = detect_explicit_ping(content, author_id, other_mentioned_ids)
-    if explicit_mention and explicit_mention not in reply:
-        reply = f"{explicit_mention} {reply}"
+        reply = resolve_pings(channel_id, reply)
+        if not reply:
+            return
 
-    for i in range(0, len(reply), DISCORD_MESSAGE_LIMIT):
-        await message.channel.send(reply[i:i + DISCORD_MESSAGE_LIMIT])
+        # If the user explicitly asked to be pinged/mentioned (or to ping a known name),
+        # make sure a real mention is actually in the reply — don't rely on the model alone.
+        explicit_mention = detect_explicit_ping(content, author_id, other_mentioned_ids)
+        if explicit_mention and explicit_mention not in reply:
+            reply = f"{explicit_mention} {reply}"
 
-    # Log the bot's own reply, plus its private reasoning behind it
-    # Discord already only got the `reply` text above) so it can actually explain "why" if
-    # asked later instead of having zero memory of its own reasoning.
-    logged_assistant_content = reply
-    if think_text:
-        logged_assistant_content = f"{reply}\n[private reasoning behind that reply: {think_text}]"
-    await asyncio.to_thread(
-        log_message, channel_id, "Niyon", bot.user.id, logged_assistant_content, is_creator=False, role="assistant"
-    )
+        for i in range(0, len(reply), DISCORD_MESSAGE_LIMIT):
+            await message.channel.send(reply[i:i + DISCORD_MESSAGE_LIMIT])
 
-    # Keep this conversation "open" for a bit so the user doesn't need to re-mention the bot
-    start_active_conversation(channel_id, author_id)
+        # Log the bot's own reply, plus its private reasoning behind it
+        # Discord already only got the `reply` text above) so it can actually explain "why" if
+        # asked later instead of having zero memory of its own reasoning.
+        logged_assistant_content = reply
+        if think_text:
+            logged_assistant_content = f"{reply}\n[private reasoning behind that reply: {think_text}]"
+        await asyncio.to_thread(
+            log_message, channel_id, "Niyon", bot.user.id, logged_assistant_content, is_creator=False, role="assistant"
+        )
+
+        # Keep this conversation "open" for a bit so the user doesn't need to re-mention the bot
+        start_active_conversation(channel_id, author_id)
 
 
 @bot.command()
