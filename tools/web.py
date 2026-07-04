@@ -17,13 +17,29 @@ def search(query: str) -> ToolResult:
         output = []
 
         for i,r in enumerate(results, 1):
+            title = r.get("title", "").strip()
+            summary = r.get("body", "").strip()[:250]
+            url = r.get("href", "").strip()
+
             output.append(
-                f"""[{i}]
-                Title: {r.get("title", "")}
-                Summary: {r.get("body", "")[:250]}
-                Source: {r.get("href","")}
-                """
+                f"""Result {i}
+
+        Title:
+        {title}
+
+        Summary:
+        {summary}
+
+        URL:
+        {url}
+
+        ----------------"""
             )
+
+        return ToolResult(
+            success=True,
+            content="\n".join(output),
+        )
 
         return ToolResult(
             success=True,

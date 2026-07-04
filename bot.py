@@ -440,32 +440,16 @@ def generate_reply(channel_id: int, content: str) -> tuple[str, str]:
         tool_context.append({
             "role": "system",
             "content": (
-                f"You already ran the '{tool_name}' tool for the query: \"{query}\".\n\n"
-
-                "SEARCH RESULTS:\n"
-                f"{result.content}\n\n"
-
-                "The search results above are your ONLY source of external information.\n\n"
-
-                "Instructions:\n"
-                "- First, determine whether the search results answer the user's question.\n"
-                "- If they do, answer directly using the information in the results.\n"
-                "- Quote or summarize the relevant result when appropriate.\n"
-                "- Do NOT say you couldn't find the answer if the answer is present.\n"
-                "- If the results genuinely do not contain the answer, clearly say you couldn't find it.\n"
-                "- Never ignore information that appears in the search results.\n"
-                "- Never contradict the search results.\n"
-                "- Never invent facts.\n"
-                "- Do not mention tools, searching, or web searches.\n"
-                "- Never say 'Looking into it', 'Searching...', or similar placeholder text.\n"
-                "- Before requesting another tool, verify that the current results are truly insufficient.\n"
-                "- Never request the same or nearly identical search twice.\n"
-                "- If enough information is already present, answer immediately.\n\n"
-
-                "Output format:\n"
-                "THINK: <one short line>\n"
-                "REPLY: <final answer>\n"
-                "Output ONLY the THINK line followed by the REPLY line."
+                f"The '{tool_name}' tool has already been executed.\n\n"
+                f"Search results:\n\n{result.content}\n\n"
+                "Use ONLY these search results.\n"
+                "If the answer is present, answer directly.\n"
+                "If multiple results contain the answer, use the best one.\n"
+                "If none contain the answer, say you couldn't find it.\n"
+                "Do NOT request another search for the same query.\n"
+                "Do NOT invent information.\n"
+                "Do NOT mention using a tool.\n"
+                "Reply in the normal THINK:/REPLY: format."
             ),
         })
         raw = _call(extra_messages=tool_context)
