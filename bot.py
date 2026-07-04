@@ -378,7 +378,8 @@ def generate_reply(channel_id: int, content: str) -> tuple[str, str]:
 
     think_text = ""
     parser_mode = "RAW"
-    tool_context = []  # accumulated system notes with tool results, carried across hops
+    tool_context = []
+    used_queries = set()
     hops = 0
 
     tool_match = TOOL_REQUEST_PATTERN.search(raw)
@@ -390,6 +391,30 @@ def generate_reply(channel_id: int, content: str) -> tuple[str, str]:
         print(f"Tool requested! (hop {hops}/{MAX_TOOL_HOPS})")
         print("Tool:", tool_name)
         print("Query:", query)
+
+        normalized_query = re.sub(r"\s+", " ", query.lower()).strip()
+        key = (tool_name, normalized_query)
+
+        if key in used_queries:
+            print("Duplicate tool request detected.")
+            tool_context.append({
+                "role": "system",
+                "content": (
+                    "You already executed this search.\n"
+                    "The previous search results already contain all available information.\n"
+                    "Do NOT request another web search.\n"
+                    "Answer the user's question using the previous search results.\n"
+                    "If the results are insufficient, explicitly say so."
+                ),
+            })
+        
+            raw = _call(extra_messages=tool_context)
+            print(f"Duplicate-search follow-up:\n{raw}")
+
+            # Ignore any further tool requests after a duplicate.
+            break
+
+        used_queries.add(key)
 
         from tool_manager import run_tool
 
@@ -415,21 +440,32 @@ def generate_reply(channel_id: int, content: str) -> tuple[str, str]:
         tool_context.append({
             "role": "system",
             "content": (
-                f"You already ran the '{tool_name}' tool for the query \"{query}\". "
-                f"Tool result:\n{result.content}\n\n"
-                "You have already used the web tool."
-                "The search results below are your ONLY source of truth."
-                "First determine whether the search results contain the answer."
-                "If they do: Answer directly. Quote or summarize the relevant result. Do NOT say you couldn't find it."
-                "If they do NOT: Say you couldn't find the answer."
-                "Never ignore information present in the search results."
-                "Never contradict the search results."
-                "Never invent facts."
-                "Don't mention that a tool was used."
-                "Niyon voice and follow the usual THINK:/REPLY: format exactly — output ONLY the "
-                "THINK: line then the REPLY: line, nothing before, between, or after them. Do not "
-                "request another tool unless you genuinely need a different query — you have "
-                "limited attempts left."
+                f"You already ran the '{tool_name}' tool for the query: \"{query}\".\n\n"
+
+                "SEARCH RESULTS:\n"
+                f"{result.content}\n\n"
+
+                "The search results above are your ONLY source of external information.\n\n"
+
+                "Instructions:\n"
+                "- First, determine whether the search results answer the user's question.\n"
+                "- If they do, answer directly using the information in the results.\n"
+                "- Quote or summarize the relevant result when appropriate.\n"
+                "- Do NOT say you couldn't find the answer if the answer is present.\n"
+                "- If the results genuinely do not contain the answer, clearly say you couldn't find it.\n"
+                "- Never ignore information that appears in the search results.\n"
+                "- Never contradict the search results.\n"
+                "- Never invent facts.\n"
+                "- Do not mention tools, searching, or web searches.\n"
+                "- Never say 'Looking into it', 'Searching...', or similar placeholder text.\n"
+                "- Before requesting another tool, verify that the current results are truly insufficient.\n"
+                "- Never request the same or nearly identical search twice.\n"
+                "- If enough information is already present, answer immediately.\n\n"
+
+                "Output format:\n"
+                "THINK: <one short line>\n"
+                "REPLY: <final answer>\n"
+                "Output ONLY the THINK line followed by the REPLY line."
             ),
         })
         raw = _call(extra_messages=tool_context)
