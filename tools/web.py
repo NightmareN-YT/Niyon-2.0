@@ -5,7 +5,7 @@ from tool_models import ToolResult
 def search(query: str) -> ToolResult:
     try:
         with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=3))
+            results = list(ddgs.text(query, max_results=5))
 
         if not results:
             return ToolResult(
