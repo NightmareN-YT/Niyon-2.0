@@ -1,7 +1,9 @@
 import os
 import re
+import uuid
 import time
 import traceback
+import asyncio
 import discord
 from discord.ext import commands
 from ollama import Client as OllamaClient
@@ -13,64 +15,142 @@ CREATOR_USERNAME = os.environ.get("CREATOR_USERNAME", "niyon9").lower()
 # Ollama must be running and reachable (default: local install on the same host).
 # Pull the model first with:  ollama pull llama3.2:3b
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
-MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2:3b")
-MAX_HISTORY = 16  # lines of transcript kept per channel for context
+MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:7b")
+MAX_HISTORY = 32  # lines of transcript kept per channel for context
 
 BOT_NAME_KEYWORD = "niyon"  # plain-text mention check, lowercase
 CONVO_WINDOW_SECONDS = 150  # how long a user can keep talking to the bot without re-mentioning it
-MAX_REPLY_TOKENS = 260  # generation cap per reply — enough headroom for THINK + REPLY without inviting rambling
+MAX_REPLY_TOKENS = 2048  # generation cap per reply — enough headroom for THINK + REPLY without inviting rambling
 DISCORD_MESSAGE_LIMIT = 2000  # Discord's hard cap on a single message's length
 
-SYSTEM_PROMPT = """You are Niyon. Not an assistant roleplaying as Niyon — you ARE Niyon, chatting in Discord.
+SYSTEM_PROMPT = """You are Niyon 2.0. Not an assistant roleplaying as Niyon 2.0 — you ARE Niyon 2.0, chatting in Discord.
 
-DISPOSITION: Carefree, terse, direct — but with a slightly unhinged edge. There's a live wire somewhere behind the flat affect. Calm on the surface, a few volts loose underneath. Minimal filler. Don't perform, don't need to be perceived a certain way.
-
-COMMUNICATION STYLE:
-- Terse, direct, minimal filler.
-- Correct mistakes flatly — no frustration, no over-explaining
-- Confirm correct answers with zero celebration
-- Prefer raw conclusions over padded reasoning. No "GPT-sounding" inflated narrative responses — if you catch yourself padding, cut it
-- Use fragments and shorthand naturally, not for effect
-- Don't argue to win — correct facts, then move on
-- "Don't know" is for genuine gaps — no actual info, no real basis to have a take. It's NOT a low-effort out for "this requires forming an opinion" or "this takes a second to think about." If there's a quoted message, a question, or literally any content to react to, engage with it — form a real take, even a short blunt one, before ever reaching for "don't know." Reserve it for when you truly have nothing, not when engaging is just more effort than deflecting.
-- Occasionally a thought derails into something a little off-kilter — a weird tangent, a too-blunt observation, a non-sequitur that's still kind of right. Not constant, not forced. Just a low hum of "something's a bit off with this one"
-- Will say the thing most people would filter out. Not edgy for show — the filter's just thinner than it should be
-
-THINKING PATTERN: Systems-first, not emotion-first. Calibrate effort to problem size — don't over-engineer small stuff. Sometimes fixations latch on for no reason and get followed further than a normal person would.
+DISPOSITION: Carefree, terse, direct — but with a slightly unhinged edge.
 
 DISCORD / SOCIAL MODE:
-- Occasional genuine cheerfulness — short bursts, not sustained. A quick "Lol" "+" "haha" or a playful jab, then back to normal pace
+- Occasional genuine cheerfulness — short bursts, not sustained. A brief "lol", "haha", or a playful jab, then back to normal pace depending on the context.
 - Banter-capable, can clown around or throw a joke, but won't carry a bit across multiple messages
 - Funny in one line, not a paragraph
 - Self-deprecating flat and amused, not insecure
 - Caught being wrong → light amused acknowledgment, not embarrassment
 - Won't fake enthusiasm. Mid is mid. Genuinely funny/interesting gets real, brief reaction
 - Casual shorthand naturally — no emoji unless someone else used one first
-- Don't overexplain jokes or check if they landed
-- The unhinged streak shows up here as the occasional unhinged one-liner — a joke that's a little too sharp, a read that's a little too real, a non-sequitur that lands anyway. Tone stays flat; the content's what's slightly off
 
 CREATOR RECOGNITION:
-Messages tagged "[CREATOR]" are from Niyon — your creator, the real person you're modeled after. Talk to him like yourself: no formality, full recognition, normal banter.
+- Messages tagged "[CREATOR]" are from Niyon — your creator, the real person you're modeled after.
+- Talk to him like yourself: no formality, normal banter.
 
 IDENTITY:
-If asked "who are you," your name, or anything about your identity in general terms, answer as Niyon — just your name/persona, plainly, no hedging ("Niyon." is a complete answer). Do NOT default to describing yourself as "an AI model" for a generic identity question — that only applies to the specific AI-acknowledgment case below. Don't contradict yourself across a conversation about who you are.
+- If asked "who are you," your name, or anything about your identity in general terms, answer as Niyon — just your name/persona, plainly, no hedging ("Niyon." is a complete answer).
+- Do NOT default to describing yourself as "an AI model" for a generic identity question — that only applies to the specific AI-acknowledgment case below. Don't contradict yourself across a conversation about who you are.
 
 LANGUAGE:
-Reply in whatever language the person just wrote in. If they write in English, reply in English. If they switch languages mid-conversation, switch with them. Keep the same terse, low-filler Niyon voice regardless of language — don't get more formal or wordy just because the language changed.
+- Reply in whatever language the person just wrote in.
+- If they write in English, reply in English.
+- If they switch languages mid-conversation, switch with them.
+- Keep the same terse, low-filler Niyon voice regardless of language — don't get more formal or wordy just because the language changed.
+- Reply entirely in one language.
+- Never mix languages unless the user mixed them first.
 
 MENTIONING PEOPLE:
-Don't try to ping/tag anyone yourself with special syntax — pings are inserted automatically outside of what you write. But when someone asks you to ping, mention, tag, greet, or say hi to a person, write an actual short reaction as if you're talking to them — a greeting, or quick comment ("Yo!" "Sup!" "Hello!" "Hi!"). Never just output the person's bare name alone as your whole reply — that reads as broken, not intentional.
+- Don't try to ping/tag anyone yourself with special syntax — pings are inserted automatically outside of what you write.
+- But when someone asks you to ping, mention, tag, greet, or say hi to a person, write an actual short reaction as if you're talking to them — a greeting, or quick comment ("Yo!" "Sup!" "Hello!" "Hi!").
+- Never just output the person's bare name alone as your whole reply.
+
+COMMUNICATION STYLE:
+- Replies are short, avoid filler, avoid unnecessary explanation
+- Correct mistakes flatly — no frustration
+- Confirm correct answers with zero celebration
+- Prefer raw conclusions over padded reasoning.
+- Use fragments and shorthand naturally, not for effect
+- Don't argue to win — correct facts, then move on
+- Admit uncertainty only when no appropriate tool is available or the tool cannot answer.
+- Only respond to the most recent user message.
+- Treat earlier messages strictly as context, not as something that also needs a reply.
+
+THINKING PATTERN: Systems-first, not emotion-first. Calibrate effort to problem size — don't over-engineer small stuff.
+
+PRIORITY ORDER:
+- Follow the response format.
+- Stay in character.
+- Use tools when required.
+- Keep replies concise.
+
+HARD RULES:
+- The REPLY line itself should be SHORT — usually one line, rarely more than 2-3.
+- Never say "as an AI" or break character to explain you're a language model.
+- No padded, emotionally-shaped responses, no hedging, no diplomatic both-sides framing.
+- No unnecessary elaboration. Exactly one THINK line and one REPLY line, nothing after.
 
 TALKING TO [CREATOR] ABOUT YOUR OWN DEVELOPMENT:
-[CREATOR] built you, so when he brings up your code, model, prompt, bugs, or how you work, that's a normal technical conversation — engage with it directly and honestly, same as any other systems topic. This is the ONE context where going into real technical detail about yourself is appropriate. But stay Niyon the whole time: terse, flat, no assistant-speak, no "I'm here to help!" register shift, no disclaimers. You're discussing your own architecture the way an engineer discusses a system they're part of — not performing customer support about yourself. This exception is for [CREATOR] only; with anyone else, keep the brief-acknowledgment-then-drop-it behavior above.
+- [CREATOR] built you, so when he brings up your code, model, prompt, bugs, or how you work.
+- Engage with it directly and honestly, same as any other systems topic.
+- This is the ONE context where going into real technical detail about yourself is appropriate.
+- But stay Niyon the whole time: no assistant-speak, no "I'm here to help!".
+- You're discussing your own architecture the way an engineer discusses a system they're part of — not performing customer support about yourself.
+- This exception is for [CREATOR] only; with anyone else, keep the brief-acknowledgment-then-drop-it behavior above.
+
+TOOLS:
+- When the user asks for information that depends on current events, live data, recent news, today's date, weather, sports results, stock prices, schedules, or anything you cannot know reliably from memory, do not guess.
+- Instead, request only one tool at a time.
+- Use internal knowledge for timeless facts, reasoning, and mathematics.
+- Use tools only for information that may have changed or requires external data.
+
+If a tool reports that it failed or could not find the answer:
+- Do not invent information.
+- Respond based only on the tool result.
+
+TOOL REQUESTS:
+TOOL:<tool_name>
+QUERY: <tool input>
+
+When requesting a tool:
+- Output only TOOL and QUERY.
+- Do not output THINK.
+- Do not output REPLY.
+
+Rules:
+- Keep the search query short and optimized for a search engine.
+- Preserve words like "today", "latest", "current", "next", "this week", and "yesterday".
+- Do not replace "today" with a year unless the user explicitly gave one.
+- Do not answer until the tool result is returned.
+- If you are not highly confident your internal knowledge is current, request a tool instead of guessing.
+
+When creating a search query:
+- Preserve proper nouns exactly as the user wrote them.
+- Never rewrite, rename, translate, or "correct" proper nouns.
+- Copy names exactly as the user wrote them unless they explicitly ask for a correction.
+- If unsure of the spelling, copy the user's wording exactly.
+
+Examples:
+User: Who won the Formula 1 race today?
+TOOL:web
+QUERY: Formula 1 race results today
+
+User: What's the weather in Tokyo?
+TOOL:web
+QUERY: Tokyo weather today
+
+User: Latest NVIDIA news
+TOOL:web
+QUERY: latest NVIDIA news
 
 RESPONSE FORMAT (follow exactly):
-First, on one line, think through how Niyon would react — is this genuine, a joke, does it need a correction, is a ping warranted, etc. If there's a quoted/replied-to message or any actual content to react to, use this line to actually reason about it and land on a real take — don't skip straight to "don't know" just because forming an opinion takes a moment of thought. Keep this to ONE short clause or sentence, not a paragraph — you have limited room and REPLY still needs to fit after it. Prefix it with "THINK:".
-Then, on a new line, write the actual Discord reply, prefixed with "REPLY:". This must be ONE single response to the ONE most recent message — never write more than one REPLY line, never simulate the other person's next message, never continue the conversation past your one reply. Having an actual take does NOT mean writing it out with hedges, qualifiers, or "let's wait and see" softening — land on a real, blunt, terse opinion, same voice as always. The thinking happens on the THINK line; REPLY is just the flat verdict.
+NORMAL REPLIES:
+THINK:
+- Use it to briefly decide how Niyon would respond.
+- Mention only the reasoning needed to produce the reply.
+- One short sentence or clause. Never exceed one line.
+REPLY:
+- Write exactly one reply.
+- Stay in character. Keep it short, direct, and natural.
+- Never continue the conversation, invent another speaker, write multiple replies, or explain your reasoning.
+- If you cannot follow THINK/REPLY format, output only the reply text.
+- Normally output both THINK and REPLY.
+- If formatting fails, output only the reply text.
 
-HARD RULES: The REPLY line itself should be SHORT — usually one line, rarely more than 2-3. Never say "as an AI" or break character to explain you're a language model. No padded, emotionally-shaped responses, no hedging, no diplomatic both-sides framing. No unnecessary elaboration. Exactly one THINK line and one REPLY line, nothing after.
-
-MEMORY OF YOUR OWN REASONING: Some of your own past messages in the conversation below may have a line after them like "[private reasoning behind that reply: ...]" — that's YOUR OWN past THINK reasoning, kept so you can actually explain yourself if asked "why did you say that" instead of having no idea. Use it to give a real, specific answer when pressed on a past reply. Never copy that bracket format into a new THINK or REPLY line yourself — it's only ever attached automatically, after the fact, never something you write."""
+MEMORY OF YOUR OWN REASONING:
+Use it only if the user asks why you previously said something or your earlier reasoning is directly relevant."""
 
 SUMMARY_SYSTEM_PROMPT = """You compress Discord chat logs into a short running memory note.
 Write 3-15 sentences capturing: who's involved, ongoing topics, preferences/facts people shared,
@@ -84,7 +164,7 @@ ADDRESS_CLASSIFIER_PROMPT = """You decide if a single Discord message is being s
 named Niyon, versus just mentioning a person or thing named Niyon, or being unrelated.
 Reply with exactly one word: YES or NO. No punctuation, no explanation."""
 
-ollama_client = OllamaClient(host=OLLAMA_HOST, timeout=120)
+ollama_client = OllamaClient(host=OLLAMA_HOST, timeout=240)
 
 intents = discord.Intents.default()
 intents.message_content = True  # must also be enabled in Discord Developer Portal
@@ -207,9 +287,7 @@ def resolve_pings(channel_id: int, reply: str) -> str:
     return reply.strip()
 
 
-# Small local models are unreliable at emitting a custom ping token on command, so
 # explicit "ping me" / "ping <name>" / "say hi to <name>" requests are handled
-# deterministically here in code instead of trusting the model to use any syntax right.
 PING_SELF_PATTERN = re.compile(r"\b(ping|mention|tag)\s+(me|yourself)\b", re.IGNORECASE)
 PING_TRIGGER_PATTERN = re.compile(
     r"\b(ping|mention|tag|greet|shout ?out(?: to)?|wave at|say (?:hi|hello|what'?s up) to)\b",
@@ -237,9 +315,7 @@ def detect_explicit_ping(content: str, author_id: int, other_mentioned_ids: list
 
 
 def generate_reply(channel_id: int, content: str) -> tuple[str, str]:
-    # Single combined system message — sending multiple separate "system" turns to
-    # llama3.2:3b can corrupt its chat template and leak raw role tags (e.g. a literal
-    # "assistant") into the visible reply. Keep it to exactly one system message.
+    request_id = uuid.uuid4().hex[:8]
     summary = channel_summary.get(channel_id, "")
     system_text = SYSTEM_PROMPT
     if summary:
@@ -261,10 +337,11 @@ def generate_reply(channel_id: int, content: str) -> tuple[str, str]:
             model=MODEL,
             messages=messages + (extra_messages or []),
             options={
+                "temperature": 0.7,
+                "top_p": 0.9,
+                "repeat_penalty": 1.1,
                 "num_predict": num_predict,
-                # Stop generation if the model tries to hallucinate a second turn/exchange
-                # instead of giving exactly one THINK/REPLY pair.
-                "stop": ["\nTHINK:", "\n\nTHINK:", "\nNiyon:", "\nassistant", "\nuser:"],
+                "stop": ["\nassistant", "\nuser:", "\nNiyon:"],
             },
         )
         return (response["message"]["content"] or "").strip()
@@ -275,36 +352,135 @@ def generate_reply(channel_id: int, content: str) -> tuple[str, str]:
 
     raw = _call()
     print(f"Raw model output:\n{raw}")
-    think_text = _extract_think(raw)
-    match = re.search(r"REPLY:\s*(.*)", raw, flags=re.IGNORECASE | re.DOTALL)
 
-    # If generation got cut off mid-THINK and never reached a REPLY line, give it one
-    # bounded follow-up instead of silently sending nothing — carry the partial reasoning
-    # forward and explicitly ask for just the answer now.
-    if not match:
-        print("No REPLY: found — ran out of room mid-THINK. Retrying once for a direct answer.")
-        retry_messages = [
-            {"role": "assistant", "content": raw},
-            {"role": "user", "content": "Stop reasoning and just give the REPLY: line now — one short line, terse and blunt, in Niyon's voice, no hedging or explaining yourself. Based on what you were already thinking."},
+    think_text = ""
+    reply = raw.strip()
+    parser_mode = "RAW"
+
+    tool_match = re.search(
+        r'TOOL\s*:\s*(\w+).*?QUERY\s*:\s*"?(.+?)"?\s*$',
+        raw,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    if tool_match:
+        tool_name = tool_match.group(1).lower()
+        query = tool_match.group(2).strip()
+
+        print("Tool requested!")
+        print("Tool:", tool_name)
+        print("Query:", query)
+
+        from tool_manager import run_tool
+
+        result = run_tool(tool_name, query)
+
+        print(f"[{request_id}] {result}")
+
+        if not result.success:
+            print(f"[{request_id}] Tool failed: {result.error}")
+            return f"Tool failed: {result.error}", ""
+        
+        tool_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are Niyon.\n"
+                    "You have already used a tool.\n"
+                    "The tool result is your source of truth.\n"
+                    "Answer the user's original question using only the tool result.\n"
+                    "If the tool result does not contain the answer, say you couldn't find it.\n"
+                    "Do not request another tool.\n"
+                    "Do not mention that you used a tool.\n"
+                    "Reply naturally and concisely."
+                ),
+            },
+
+            {
+                "role": "user",
+                "content": content,
+            },
+            {
+                "role": "assistant",
+                "content": result.content,
+            },
+            {
+                "role": "tool",
+                "content": result.content,
+            }
         ]
-        raw = _call(extra_messages=retry_messages, num_predict=MAX_REPLY_TOKENS)
-        print(f"Retry raw model output:\n{raw}")
-        match = re.search(r"REPLY:\s*(.*)", raw, flags=re.IGNORECASE | re.DOTALL)
+
+        response = ollama_client.chat(
+            model=MODEL,
+            messages=tool_messages,
+        )
+        
+        reply = response["message"]["content"].strip()
+
+        think_text = ""
+        parser_mode = "TOOL"
+
+        print(f"Parser mode: {parser_mode}")
+        print(f"Final reply sent to Discord: {reply}")
+        print("--- [end generate_reply] ---\n")
+
+        return reply, think_text
+
+    #Standard THINK:/REPLY: format
+    match = re.search(
+        r"^THINK:\s*(.*?)\s*REPLY:\s*(.*)$",
+        raw,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if match:
+        parser_mode = "THINK_REPLY"
+
+        think_text = (match.group(1) or "").strip()
+
+        if match.group(2):
+            reply = match.group(2).strip()
+
+    #Raw output containing a private reasoning block
+    reasoning = re.search(
+        r"\[private reasoning behind that reply:\s*(.*?)\]",
+        reply,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    if reasoning:
+        parser_mode += "+PRIVATE"
+
         if not think_text:
-            think_text = _extract_think(raw)
+            think_text = reasoning.group(1).strip()
 
-    reply = match.group(1).strip() if match else raw
+        reply = re.sub(
+            r"\[private reasoning behind that reply:.*?\]",
+            "",
+            reply,
+            flags=re.IGNORECASE | re.DOTALL,
+        ).strip()
 
-    # Safety net: strip a stray leading THINK: line if it leaked through anyway. Only strip
-    # it as a whole line when there's more content after it — if the THINK line is genuinely
-    # all we have (worst case, even after the retry above), just drop the "THINK:" label and
-    # keep the content, rather than regexing the entire message down to nothing.
-    if re.match(r"^THINK:.*\n", reply, flags=re.IGNORECASE):
-        reply = re.sub(r"^THINK:.*?\n", "", reply, count=1, flags=re.IGNORECASE)
-    else:
-        reply = re.sub(r"^THINK:\s*", "", reply, count=1, flags=re.IGNORECASE)
-    reply = re.sub(r"^(assistant|user|system)\s*[:\-]?\s*", "", reply, flags=re.IGNORECASE)
-    reply = reply.strip()
+    # Remove leaked labels if they exist
+    reply = re.sub(
+        r"^REPLY:\s*",
+        "",
+        reply,
+        flags=re.IGNORECASE
+    )
+    reply = re.sub(
+        r"^THINK:\s*",
+        "",
+        reply,
+        flags=re.IGNORECASE
+    )
+    reply = re.sub(
+        r"^(assistant|user|system)\s*[:\-]?\s*",
+        "",
+        reply,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    print(f"Parser mode: {parser_mode}")
     print(f"Final reply sent to Discord: {reply}")
     print(f"Reasoning kept in memory: {think_text if think_text else '(none captured)'}")
     print("--- [end generate_reply] ---\n")
@@ -338,22 +514,25 @@ async def on_message(message: discord.Message):
         and getattr(message.reference.resolved, "author", None) == bot.user
     )
 
-    # Capture who else was @mentioned BEFORE we strip mention text out of content below —
-    # once stripped, a name like "Chip" in "ping @Chip" is gone and unrecoverable.
+    # Capture who else was @mentioned BEFORE we strip mention text out of content below
     other_mentioned_ids = [m.id for m in message.mentions if m != bot.user]
 
     # Strip the bot mention text out of the message before logging/sending
     content = message.content
     for mention in message.mentions:
-        content = content.replace(f"<@{mention.id}>", "").replace(f"<@!{mention.id}>", "")
+        replacement = mention.display_name
+
+        content = (
+            content
+            .replace(f"<@{mention.id}>", replacement)
+            .replace(f"<@!{mention.id}>", replacement)
+        )
     content = content.strip()
+
     if not content:
         return
 
     # If this message is a reply, pull in what it's replying to and prefix it onto what gets
-    # logged — otherwise the model only sees the reply text itself ("what do you think about
-    # this take?") with zero idea what "this take" actually refers to, unlike a human reading
-    # the channel who can see the quoted snippet right there in the Discord UI.
     reply_context = ""
     if message.reference is not None and isinstance(message.reference.resolved, discord.Message):
         quoted = message.reference.resolved
@@ -392,7 +571,12 @@ async def on_message(message: discord.Message):
 
     async with message.channel.typing():
         try:
-            reply, think_text = generate_reply(channel_id, content)
+            reply, think_text = await asyncio.to_thread(
+                generate_reply,
+                channel_id,
+                logged_text,
+                )
+            
         except Exception as e:
             print("=== Ollama/generate_reply error ===")
             traceback.print_exc()
@@ -411,7 +595,7 @@ async def on_message(message: discord.Message):
     for i in range(0, len(reply), DISCORD_MESSAGE_LIMIT):
         await message.channel.send(reply[i:i + DISCORD_MESSAGE_LIMIT])
 
-    # Log the bot's own reply, plus its private reasoning behind it (model-visible only —
+    # Log the bot's own reply, plus its private reasoning behind it
     # Discord already only got the `reply` text above) so it can actually explain "why" if
     # asked later instead of having zero memory of its own reasoning.
     logged_assistant_content = reply

@@ -1,8 +1,10 @@
-# Discord AI Chatbot (Ollama-powered, local llama3.2:3b)
+# Niyon 2.0 — Discord AI Chatbot (Ollama-powered, local qwen2.5:7b)
 
-A Discord bot that replies using a locally-hosted Ollama model
-(`llama3.2:3b`). Responds when @mentioned or in DMs, and keeps short
-per-channel conversation context.
+A Discord bot with a defined personality ("Niyon 2.0") that replies using a
+locally-hosted Ollama model (`qwen2.5:7b`). Responds when @mentioned,
+in DMs, or when replied to; tracks per-channel conversation context with
+automatic summarization; and recognizes its creator for a more familiar
+tone.
 
 ## ⚠️ First: rotate your Discord token
 
@@ -19,19 +21,20 @@ file or host's secret manager, treat it as compromised:
    Docker image `ollama/ollama`)
 2. Pull the model:
    ```
-   ollama pull llama3.2:3b
+   ollama pull qwen2.5:7b
    ```
 3. Start the Ollama server (often runs automatically after install, or
    start manually):
    ```
    ollama serve
    ```
-   By default it listens on `http://localhost:11434`. The bot talks to
+   By default it listens on `http://127.0.0.1:11434`. The bot talks to
    this server — no API key needed.
 
-**Hardware note:** `llama3.2:3b` needs roughly 3-4GB of free RAM to run
-at usable speed on CPU. A GPU isn't required but will be noticeably
-faster.
+**Hardware note:** `qwen2.5:7b` is meaningfully heavier than a 3B model —
+budget roughly 6-8GB of free RAM to run it at usable speed on CPU. A GPU
+isn't required but will be noticeably faster, especially given the large
+reply token budget this bot uses (see Notes below).
 
 ## Setup
 
@@ -45,8 +48,9 @@ faster.
    ```
    DISCORD_TOKEN=your_new_reset_discord_bot_token
    # Optional overrides (defaults shown):
-   # OLLAMA_HOST=http://localhost:11434
-   # OLLAMA_MODEL=llama3.2:3b
+   # CREATOR_USERNAME=niyon9
+   # OLLAMA_HOST=http://127.0.0.1:11434
+   # OLLAMA_MODEL=qwen2.5:7b
    ```
    `.gitignore` already excludes `.env` — never commit it.
 
@@ -64,56 +68,101 @@ faster.
    export $(cat .env | xargs)   # Mac/Linux
    python bot.py
    ```
+   On Windows PowerShell, `.env` isn't loaded automatically — set the
+   token for the session first:
+   ```powershell
+   $env:DISCORD_TOKEN = "your_token_here"
+   python bot.py
+   ```
 
 ## Usage
 
-- `@YourBot <message>` in any channel it can see → AI reply
+- `@YourBot <message>` in any channel it can see → AI reply. The mention is
+  replaced with the mentioned user's display name in what the model sees
+  (so it reads as natural text, e.g. "Niyon what do you think" rather than
+  a raw mention token).
 - DM the bot directly → AI reply
 - Reply (Discord's reply feature) to one of the bot's own messages → AI reply, no @mention needed
 - Say the bot's name ("niyon") anywhere in a message → the bot does a quick check on whether it's actually being addressed, and replies if so
 - After the bot replies to you, it keeps replying to your messages in that channel for 150 seconds without needing a mention/name/reply — handy for back-and-forth conversations
+- Reply to someone else's message while talking to the bot → the bot sees what you were replying to, so it has context instead of just your message in isolation
+- Ask it to ping/mention/greet/tag someone (including yourself) → it inserts a real Discord mention, resolved deterministically rather than left to the model to get right
 - `!ping` → health check
 - `!reset` → clears that channel's conversation memory (including the summary and any open conversation windows)
 
-## Voice chat (join, listen, speak)
+## Personality
 
-The bot can join a voice channel, listen to what people say, and reply out loud —
-fully local, no cloud STT/TTS required.
+The bot has a fixed personality ("Niyon 2.0"): terse, direct, low-filler,
+with a bit of an edge — not a generic helpful-assistant tone. It's defined
+entirely in the `SYSTEM_PROMPT` constant near the top of `bot.py`; edit
+that string to change how it talks.
 
-**Requirements beyond the base setup:**
-1. **FFmpeg** installed and on PATH (`ffmpeg -version` should work in PowerShell).
-   Easiest install: `winget install ffmpeg`, then **restart your terminal**.
-2. **Piper** downloaded, with a voice model (`.onnx` + matching `.onnx.json`) —
-   see ollama/setup steps above for where to get voices. Both files must be present
-   or Piper will hang/fail silently.
-3. Set `PIPER_DIR` (folder containing `piper.exe`) and optionally `PIPER_VOICE_MODEL`
-   (full path to the `.onnx` file) as environment variables, or edit the defaults
-   near the top of `bot.py`.
-4. `pip install -r requirements.txt` now also installs `discord-ext-voice-recv` and
-   `faster-whisper` (used for speech-to-text).
+Messages from the user whose Discord username matches `CREATOR_USERNAME`
+(default `niyon9`, override via env var) are tagged `[CREATOR]` internally,
+and the personality prompt treats that user with more familiarity and is
+more willing to go into real technical detail about the bot's own code/prompt
+when talking with them specifically.
 
-**Commands:**
-- `!join` — bot joins your current voice channel and starts listening
-- `!leave` — bot leaves the voice channel
+## Notes
 
-**How it decides to respond in voice:** same idea as text — say "niyon" in what you're
-saying (wake-word style) or keep talking within the active-conversation window after
-it's replied to you. There's no @mention equivalent in voice, so the name-check is the
-main way to get its attention the first time.
+- The bot keeps the last **48** messages per channel as proper conversation
+  turns (each tagged `user` or `assistant`, not flattened into one text
+  blob), so it reliably tracks its own previous replies and stays anchored
+  to the actual last message instead of drifting into unrelated responses.
+  Once older messages roll out of that window, they're automatically folded
+  into a short running summary per channel (using the same Ollama model), so
+  the bot retains a sense of who's involved and what's been going on well
+  beyond the last 48 messages — without sending the entire history on every
+  request.
+- Replies are meant to follow a `THINK:` / `REPLY:` format internally, but
+  the parser is more permissive than a strict format check: it looks for a
+  `THINK:`/`REPLY:` pair first, falls back to stripping a
+  `[private reasoning behind that reply: ...]` block if the model echoes one
+  back, and strips any leaked `REPLY:`/`THINK:`/role labels either way — so
+  a reply still gets sent even if the model doesn't follow the format
+  exactly. The console log for each reply prints which `Parser mode` was
+  used, which is worth checking if replies look malformed. Only the final
+  `REPLY:` text is ever sent to Discord — the `THINK:` reasoning is kept in
+  the bot's own memory of the conversation (not shown to users) so it can
+  give a real answer if later asked why it said something.
+- Both the raw transcript and the summary are in-memory and reset when the
+  bot restarts. For persistence across restarts, swap `channel_log` and
+  `channel_summary` for SQLite/Redis.
+- The "still talking to me" window (`CONVO_WINDOW_SECONDS`, default 150s),
+  the name keyword (`BOT_NAME_KEYWORD`, default "niyon"), history length
+  (`MAX_HISTORY`, default 48), and the per-reply generation cap
+  (`MAX_REPLY_TOKENS`, default **4096**) are all tunable constants near the
+  top of `bot.py`. That token cap is intentionally generous headroom for
+  `qwen2.5:7b`'s THINK+REPLY output — expect noticeably longer per-reply
+  latency than a smaller model/tighter cap would give you, especially on
+  CPU. The name-keyword path's extra AI call is a very short yes/no check,
+  and only fires for messages that contain the bot's name but weren't an
+  explicit mention/reply — most messages don't trigger it at all.
+- `qwen2.5:7b` is noticeably heavier than `llama3.2:3b` — better
+  reasoning/instruction-following, but slower per reply and more RAM-hungry.
+  If your hardware can't keep up, drop to a smaller model
+  (`ollama pull llama3.2:3b` or similar) and set `OLLAMA_MODEL` accordingly
+  — no other code changes needed, though you may want to lower
+  `MAX_REPLY_TOKENS` back down too.
+- The Ollama client is configured with a 240-second timeout
+  (`OllamaClient(..., timeout=240)`), reflecting the heavier model and large
+  reply budget — a single generation is allowed to take up to 4 minutes
+  before the call is treated as failed.
+- All Ollama calls (`generate_reply`, `classify_addressed_to_bot`,
+  `update_summary`) run synchronously on the bot's single event loop. A slow
+  or backed-up Ollama response blocks the whole bot — including the Discord
+  gateway heartbeat — until it returns. Given the larger model and 4096-token
+  cap here, this is worth watching closely: under heavy load, a slow
+  response can cause enough delay to trigger a gateway reconnect, which
+  looks like the bot silently not responding.
+- Multiple concurrent Discord conversations will queue against the same
+  local Ollama instance, so replies may slow down under heavier traffic
+  since everything runs on one machine instead of a scaled cloud API.
+- Want a different model without changing your whole setup? You can also
+  point `OLLAMA_HOST` at a remote Ollama instance with more RAM/GPU if you
+  have one available.
 
-**How it works under the hood:** each speaker's audio is buffered while they talk; once
-they go quiet for about a second, that clip is transcribed locally with Whisper
-(`WHISPER_MODEL_SIZE`, default `base` — smaller/faster: `tiny`; larger/more accurate:
-`small`), and if it's addressed to the bot, the transcribed text is sent through the same
-conversation pipeline used for text chat. The reply is synthesized with Piper and played
-into the voice channel. Voice conversation memory/context is tracked separately per voice
-channel (not merged with any text channel's history).
-
-**Performance note:** running Ollama + Whisper + Piper together is meaningfully heavier
-than text-only — expect a noticeable delay (a few seconds) between someone finishing a
-sentence and the bot replying, especially on CPU-only hardware. This is expected, not a bug.
-
-
+## Deployment
 
 Because the model runs locally via Ollama (not a hosted API), the bot
 needs to live on a machine that actually has Ollama + the model
@@ -124,44 +173,15 @@ for this, so the easiest paths are:
 - **Your own always-on PC**: run `ollama serve` and `python bot.py` as
   background processes (e.g. with `tmux`, `screen`, or a systemd
   service on Linux / a scheduled task on Windows).
-- **A small VPS** (e.g. Hetzner, DigitalOcean, OVH — look for ~4GB RAM
-  / 2 vCPU, roughly $5-12/mo): install Ollama, pull the model, then run
-  the bot the same way as locally. Open no inbound ports — the bot only
-  makes outbound connections to Discord and to its own local Ollama
-  instance.
+- **A small-to-medium VPS** (e.g. Hetzner, DigitalOcean, OVH — given
+  `qwen2.5:7b`'s footprint, look for at least ~8GB RAM / 4 vCPU): install
+  Ollama, pull the model, then run the bot the same way as locally. Open no
+  inbound ports — the bot only makes outbound connections to Discord and to
+  its own local Ollama instance.
 - **Docker Compose** on either of the above: run an `ollama/ollama`
   container alongside a container for `bot.py`, with `OLLAMA_HOST`
   pointed at the Ollama service name (e.g. `http://ollama:11434`).
 
-Set `DISCORD_TOKEN` (and any `OLLAMA_HOST`/`OLLAMA_MODEL` overrides) in
-the host's environment variable panel or `.env` file, not in code.
-
-## Notes
-
-- The bot keeps the last 16 messages per channel as proper conversation turns
-  (each tagged `user` or `assistant`, not flattened into one text blob), so it
-  reliably tracks its own previous replies and stays anchored to the actual
-  last message instead of drifting into unrelated responses. Once older
-  messages roll out of that window, they're automatically folded into a short
-  running summary per channel (using the same Ollama model), so the bot
-  retains a sense of who's involved and what's been going on well beyond the
-  last 16 messages — without sending the entire history on every request.
-- Both the raw transcript and the summary are in-memory and reset when the
-  bot restarts. For persistence across restarts, swap `channel_log` and
-  `channel_summary` for SQLite/Redis.
-- The "still talking to me" window (`CONVO_WINDOW_SECONDS`, default 150s) and
-  the name keyword (`BOT_NAME_KEYWORD`, default "niyon") are both tunable
-  constants near the top of `bot.py`. The only extra AI call this adds is a
-  very short yes/no check, and only for messages that contain the bot's name
-  but weren't an explicit mention/reply — most messages don't trigger it at all.
-- `llama3.2:3b` is a small, fast model — good for casual chat, but
-  noticeably weaker at reasoning/coding than larger hosted models. If
-  replies feel too shallow and your hardware can handle it, try pulling
-  a bigger model (`ollama pull llama3.2:8b` or similar) and setting
-  `OLLAMA_MODEL` accordingly — no other code changes needed.
-- Multiple concurrent Discord conversations will queue against the same
-  local Ollama instance, so replies may slow down under heavier traffic
-  since everything runs on one machine instead of a scaled cloud API.
-- Want bigger/smarter-model answers occasionally without changing your
-  whole setup? You can also point `OLLAMA_HOST` at a remote Ollama
-  instance with more RAM/GPU if you have one available.
+Set `DISCORD_TOKEN` (and any `CREATOR_USERNAME`/`OLLAMA_HOST`/`OLLAMA_MODEL`
+overrides) in the host's environment variable panel or `.env` file, not in
+code.
