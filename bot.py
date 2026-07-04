@@ -7,6 +7,7 @@ import asyncio
 import discord
 from discord.ext import commands
 from ollama import Client as OllamaClient
+from tool_models import ToolResult
 
 # --- Config ---
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
@@ -314,6 +315,13 @@ def detect_explicit_ping(content: str, author_id: int, other_mentioned_ids: list
     return None
 
 
+TOOL_REQUEST_PATTERN = re.compile(
+    r'TOOL\s*:\s*(\w+).*?QUERY\s*:\s*"?(.+?)"?\s*$',
+    flags=re.IGNORECASE | re.DOTALL,
+)
+MAX_TOOL_HOPS = 2  # bound how many times a single reply can chain tool calls before we force an answer
+
+
 def generate_reply(channel_id: int, content: str) -> tuple[str, str]:
     request_id = uuid.uuid4().hex[:8]
     summary = channel_summary.get(channel_id, "")
@@ -354,38 +362,42 @@ def generate_reply(channel_id: int, content: str) -> tuple[str, str]:
     print(f"Raw model output:\n{raw}")
 
     think_text = ""
-    reply = raw.strip()
     parser_mode = "RAW"
+    tool_context = []  # accumulated system notes with tool results, carried across hops
+    hops = 0
 
-    tool_match = re.search(
-        r'TOOL\s*:\s*(\w+).*?QUERY\s*:\s*"?(.+?)"?\s*$',
-        raw,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-
-    if tool_match:
+    tool_match = TOOL_REQUEST_PATTERN.search(raw)
+    while tool_match and hops < MAX_TOOL_HOPS:
+        hops += 1
         tool_name = tool_match.group(1).lower()
         query = tool_match.group(2).strip()
 
-        print("Tool requested!")
+        print(f"Tool requested! (hop {hops}/{MAX_TOOL_HOPS})")
         print("Tool:", tool_name)
         print("Query:", query)
 
         from tool_manager import run_tool
 
-        result = run_tool(tool_name, query)
-
+        try:
+            result = run_tool(tool_name, query)
+        except Exception as e:
+            result = ToolResult(
+                success=False,
+                content="",
+                error=str(e),
+            )
         print(f"[{request_id}] {result}")
 
         if not result.success:
             print(f"[{request_id}] Tool failed: {result.error}")
             return f"Tool failed: {result.error}", ""
 
-        # Feed the tool result back in as one more system note, keeping the FULL persona
-        # and conversation history intact (reusing `messages` from above) — otherwise the
-        # follow-up reply comes from a bare, generic prompt with zero memory of the ongoing
-        # conversation and none of Niyon's actual voice/behavior rules.
-        tool_note = {
+        parser_mode = "TOOL"
+        # Feed the tool result back in as a system note, keeping the FULL persona and
+        # conversation history intact (reusing `messages` from above) — otherwise the
+        # follow-up reply comes from a bare, generic prompt with zero memory of the
+        # ongoing conversation and none of Niyon's actual voice/behavior rules.
+        tool_context.append({
             "role": "system",
             "content": (
                 f"You already ran the '{tool_name}' tool for the query \"{query}\". "
@@ -393,13 +405,30 @@ def generate_reply(channel_id: int, content: str) -> tuple[str, str]:
                 "Answer the user's original message using ONLY this tool result — don't invent "
                 "anything beyond it, and if it doesn't actually answer the question, say you "
                 "couldn't find it. Don't mention that a tool was used. Stay fully in your normal "
-                "Niyon voice and follow the usual THINK:/REPLY: format."
+                "Niyon voice and follow the usual THINK:/REPLY: format. Do not request another tool "
+                "unless you genuinely need a different query — you have limited attempts left."
             ),
-        }
-        raw = _call(extra_messages=[tool_note])
-        print(f"Tool follow-up raw output:\n{raw}")
-        reply = raw.strip()
-        parser_mode = "TOOL"
+        })
+        raw = _call(extra_messages=tool_context)
+        print(f"Tool follow-up raw output (hop {hops}):\n{raw}")
+        tool_match = TOOL_REQUEST_PATTERN.search(raw)
+
+    if tool_match:
+        # Hit the hop limit and it's STILL asking for another tool — cut it off and force
+        # a direct answer instead of ever letting literal "TOOL:x / QUERY:y" text reach Discord.
+        print(f"Hit tool hop limit ({MAX_TOOL_HOPS}) — forcing a direct answer.")
+        tool_context.append({
+            "role": "system",
+            "content": (
+                "You've used your available tool attempts. Stop requesting tools and answer "
+                "directly now using whatever information you already have, even if incomplete — "
+                "say you couldn't fully find it if needed. Follow the usual THINK:/REPLY: format."
+            ),
+        })
+        raw = _call(extra_messages=tool_context)
+        print(f"Forced final answer raw output:\n{raw}")
+
+    reply = raw.strip()
 
     #Standard THINK:/REPLY: format
     match = re.search(
@@ -454,6 +483,13 @@ def generate_reply(channel_id: int, content: str) -> tuple[str, str]:
         reply,
         flags=re.IGNORECASE,
     ).strip()
+
+    # Last-resort safety net: never let literal tool-request syntax reach Discord, even if
+    # every check above somehow missed it (e.g. an unbounded edge case in the hop loop).
+    if TOOL_REQUEST_PATTERN.search(reply):
+        print("WARNING: leaked TOOL:/QUERY: syntax survived to final reply — replacing with fallback.")
+        reply = "Couldn't get a straight answer on that, try asking again."
+        parser_mode += "+LEAK_CAUGHT"
 
     print(f"Parser mode: {parser_mode}")
     print(f"Final reply sent to Discord: {reply}")
