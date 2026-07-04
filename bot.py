@@ -380,51 +380,26 @@ def generate_reply(channel_id: int, content: str) -> tuple[str, str]:
         if not result.success:
             print(f"[{request_id}] Tool failed: {result.error}")
             return f"Tool failed: {result.error}", ""
-        
-        tool_messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are Niyon.\n"
-                    "You have already used a tool.\n"
-                    "The tool result is your source of truth.\n"
-                    "Answer the user's original question using only the tool result.\n"
-                    "If the tool result does not contain the answer, say you couldn't find it.\n"
-                    "Do not request another tool.\n"
-                    "Do not mention that you used a tool.\n"
-                    "Reply naturally and concisely."
-                ),
-            },
 
-            {
-                "role": "user",
-                "content": content,
-            },
-            {
-                "role": "assistant",
-                "content": result.content,
-            },
-            {
-                "role": "tool",
-                "content": result.content,
-            }
-        ]
-
-        response = ollama_client.chat(
-            model=MODEL,
-            messages=tool_messages,
-        )
-        
-        reply = response["message"]["content"].strip()
-
-        think_text = ""
+        # Feed the tool result back in as one more system note, keeping the FULL persona
+        # and conversation history intact (reusing `messages` from above) — otherwise the
+        # follow-up reply comes from a bare, generic prompt with zero memory of the ongoing
+        # conversation and none of Niyon's actual voice/behavior rules.
+        tool_note = {
+            "role": "system",
+            "content": (
+                f"You already ran the '{tool_name}' tool for the query \"{query}\". "
+                f"Tool result:\n{result.content}\n\n"
+                "Answer the user's original message using ONLY this tool result — don't invent "
+                "anything beyond it, and if it doesn't actually answer the question, say you "
+                "couldn't find it. Don't mention that a tool was used. Stay fully in your normal "
+                "Niyon voice and follow the usual THINK:/REPLY: format."
+            ),
+        }
+        raw = _call(extra_messages=[tool_note])
+        print(f"Tool follow-up raw output:\n{raw}")
+        reply = raw.strip()
         parser_mode = "TOOL"
-
-        print(f"Parser mode: {parser_mode}")
-        print(f"Final reply sent to Discord: {reply}")
-        print("--- [end generate_reply] ---\n")
-
-        return reply, think_text
 
     #Standard THINK:/REPLY: format
     match = re.search(
@@ -433,7 +408,7 @@ def generate_reply(channel_id: int, content: str) -> tuple[str, str]:
         flags=re.IGNORECASE | re.DOTALL,
     )
     if match:
-        parser_mode = "THINK_REPLY"
+        parser_mode = f"{parser_mode}+THINK_REPLY" if parser_mode == "TOOL" else "THINK_REPLY"
 
         think_text = (match.group(1) or "").strip()
 
@@ -546,7 +521,7 @@ async def on_message(message: discord.Message):
     channel_id = message.channel.id
     author_id = message.author.id
     logged_text = f"{reply_context}{content}"
-    log_message(channel_id, message.author.display_name, author_id, logged_text, is_creator)
+    await asyncio.to_thread(log_message, channel_id, message.author.display_name, author_id, logged_text, is_creator)
     print(f"\n[on_message] #{message.channel} <{message.author.display_name}>: {logged_text}")
 
     # Tiered "should I respond" check:
@@ -561,7 +536,7 @@ async def on_message(message: discord.Message):
         should_respond = True
         reason = "active_conversation_window"
     if not should_respond and is_addressed_to_bot(content):
-        should_respond = classify_addressed_to_bot(content)
+        should_respond = await asyncio.to_thread(classify_addressed_to_bot, content)
         reason = "name_keyword+classifier=yes" if should_respond else "name_keyword+classifier=no"
 
     print(f"[on_message] should_respond={should_respond} reason={reason}")
@@ -601,7 +576,9 @@ async def on_message(message: discord.Message):
     logged_assistant_content = reply
     if think_text:
         logged_assistant_content = f"{reply}\n[private reasoning behind that reply: {think_text}]"
-    log_message(channel_id, "Niyon", bot.user.id, logged_assistant_content, is_creator=False, role="assistant")
+    await asyncio.to_thread(
+        log_message, channel_id, "Niyon", bot.user.id, logged_assistant_content, is_creator=False, role="assistant"
+    )
 
     # Keep this conversation "open" for a bit so the user doesn't need to re-mention the bot
     start_active_conversation(channel_id, author_id)
